@@ -112,22 +112,35 @@
     }
 
     .logged-in {
-      display: flex;
-      flex-direction: column;
-      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      height: 100vh;
       width: 100%;
+      overflow: hidden;
+      position: relative;
+      isolation: isolate;
     }
 
     .header {
-      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      z-index: 40;
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.875rem 1.5rem;
+      flex-direction: column;
+      align-items: stretch;
+      padding: 0.875rem 1.25rem 0.75rem;
       background: var(--surface);
       border-bottom: 1px solid var(--border);
-      gap: 1rem;
+      gap: 0.7rem;
       box-shadow: var(--shadow);
+    }
+
+    .header-main {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1rem;
+      min-width: 0;
     }
 
     .header-profile {
@@ -166,6 +179,19 @@
 
     .header-status:empty { display: none; }
     .header-status.error { color: var(--error); }
+    .header-status.youtube-limit {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 0.45rem 0.8rem;
+      border-radius: 8px;
+      border: 1px solid rgba(194, 61, 61, 0.45);
+      background: rgba(194, 61, 61, 0.1);
+      color: #8e1f1f;
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      line-height: 1.35;
+    }
 
     .header-actions {
       display: flex;
@@ -199,27 +225,28 @@
     }
 
     .btn.btn-uploading {
-      position: relative;
-      padding-left: 2.35rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.45rem;
+      white-space: nowrap;
     }
 
     .btn.btn-uploading::before {
       content: "";
-      position: absolute;
-      left: 0.75rem;
-      top: 50%;
+      position: static;
       width: 0.85rem;
       height: 0.85rem;
       border: 2px solid currentColor;
       border-right-color: transparent;
       border-radius: 50%;
-      transform: translateY(-50%);
       animation: btn-spin 0.8s linear infinite;
+      flex: 0 0 auto;
     }
 
     @keyframes btn-spin {
-      from { transform: translateY(-50%) rotate(0deg); }
-      to { transform: translateY(-50%) rotate(360deg); }
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
 
     .btn-primary {
@@ -235,10 +262,13 @@
     }
 
     .media-area {
-      flex: 1;
-      overflow-y: auto;
-      padding: 1.25rem;
       min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 1rem 1.25rem;
+      background: var(--bg);
+      position: relative;
+      z-index: 1;
     }
 
     .media-grid {
@@ -469,18 +499,26 @@
       font-size: 0.8125rem;
     }
 
-    /* —— Fixed footer (mirrors header) —— */
+    .footer-rail {
+      position: sticky;
+      bottom: 0;
+      z-index: 35;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      box-shadow: 0 -2px 8px rgba(0,0,0,0.04);
+    }
+
+    /* —— Pinned footer rail —— */
     .app-footer {
-      flex-shrink: 0;
       display: flex;
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 0.75rem;
-      padding: 0.875rem 1.5rem;
+      padding: 0.8rem 1.25rem;
       background: var(--surface);
-      border-top: 1px solid var(--border);
-      box-shadow: 0 -2px 8px rgba(0,0,0,0.04);
+      border-top: none;
+      box-shadow: none;
     }
 
     .footer-stats {
@@ -535,10 +573,11 @@
     .camera-info-bar.hidden { display: none; }
 
     .camera-info-bar-footer {
-      flex-shrink: 0;
-      padding: 0.75rem 1.25rem 1rem;
+      padding: 0.65rem 1.25rem 0.9rem;
       border-top: 1px solid var(--border);
       background: var(--surface);
+      max-height: 34vh;
+      overflow: auto;
     }
 
     .camera-card {
@@ -589,9 +628,9 @@
     }
 
     .species-filter-bar {
-      margin-bottom: 1rem;
-      padding: 0.75rem;
-      background: var(--surface);
+      margin: 0;
+      padding: 0.55rem 0.65rem;
+      background: var(--surface-alt);
       border: 1px solid var(--border);
       border-radius: var(--radius-sm);
       display: flex;
@@ -633,6 +672,20 @@
       background: var(--accent);
       border-color: var(--accent);
       color: #fff;
+    }
+
+    @media (max-width: 980px) {
+      .header-main {
+        grid-template-columns: 1fr;
+        gap: 0.55rem;
+      }
+      .header-status {
+        text-align: left;
+        padding: 0;
+      }
+      .header-actions {
+        justify-content: flex-start;
+      }
     }
 
     .modal-overlay {
@@ -724,32 +777,36 @@
 
   <main id="loggedInScreen" class="logged-in hidden">
     <header class="header">
-      <div class="header-profile">
-        <img id="avatar" class="avatar" src="" alt="" />
-        <span class="header-title">GetBirds</span>
+      <div class="header-main">
+        <div class="header-profile">
+          <img id="avatar" class="avatar" src="" alt="" />
+          <span class="header-title">GetBirds</span>
+        </div>
+        <div id="headerStatus" class="header-status" aria-live="polite"></div>
+        <div class="header-actions">
+          <button type="button" id="downloadAllBtn" class="btn btn-primary" hidden>Download all</button>
+          <button type="button" id="signoutBtn" class="btn">Sign out</button>
+        </div>
       </div>
-      <div id="headerStatus" class="header-status" aria-live="polite"></div>
-      <div class="header-actions">
-        <button type="button" id="downloadAllBtn" class="btn btn-primary" hidden>Download all</button>
-        <button type="button" id="signoutBtn" class="btn">Sign out</button>
-      </div>
+      <div id="speciesFilterBar" class="species-filter-bar hidden" aria-label="Filter postcards"></div>
     </header>
     <div class="media-area">
-      <div id="speciesFilterBar" class="species-filter-bar hidden" aria-label="Filter by bird species"></div>
       <div id="mediaGrid" class="media-grid"></div>
       <p id="mediaStatus" class="media-loading" hidden>Loading postcards…</p>
       <p id="mediaError" class="media-error" hidden></p>
       <p id="mediaEmpty" class="media-empty" hidden>No postcards yet.</p>
     </div>
-    <footer id="appFooter" class="app-footer" aria-live="polite">
-      <div class="footer-stats" id="footerStats">0 postcards displayed</div>
-      <div class="footer-actions" id="footerActions">
-        <button type="button" id="loadMoreBtn" class="load-more" hidden>Load more</button>
-        <button type="button" id="loadAllBtn" class="load-more" hidden>Load all postcards</button>
-        <button type="button" id="downloadAllMediaBtn" class="btn-mega" hidden>DOWNLOAD ALL MEDIA</button>
-      </div>
-    </footer>
-    <div id="cameraInfoBar" class="camera-info-bar camera-info-bar-footer hidden" aria-label="BirdBuddy cameras"></div>
+    <div class="footer-rail">
+      <footer id="appFooter" class="app-footer" aria-live="polite">
+        <div class="footer-stats" id="footerStats">0 postcards displayed</div>
+        <div class="footer-actions" id="footerActions">
+          <button type="button" id="loadMoreBtn" class="load-more" hidden>Load more</button>
+          <button type="button" id="loadAllBtn" class="load-more" hidden>Load all postcards</button>
+          <button type="button" id="downloadAllMediaBtn" class="btn-mega" hidden>DOWNLOAD ALL MEDIA</button>
+        </div>
+      </footer>
+      <div id="cameraInfoBar" class="camera-info-bar camera-info-bar-footer hidden" aria-label="BirdBuddy cameras"></div>
+    </div>
   </main>
 
   <div id="youtubeUploadModalOverlay" class="modal-overlay hidden" aria-modal="true" aria-labelledby="youtubeModalTitle">
@@ -789,13 +846,16 @@
     name: "google_name",
     bbAccessToken: "bb_access_token",
     bbExpiresAt: "bb_expires_at",
-    bbRefreshToken: "bb_refresh_token"
+    bbRefreshToken: "bb_refresh_token",
+    youtubeUploadBlockedUntil: "youtube_upload_blocked_until",
+    youtubeUploadBlockedReason: "youtube_upload_blocked_reason"
   };
 
   /* BirdBuddy token considered stale this many ms before expiry (refresh proactively). */
   const BB_TOKEN_STALE_MS = 2 * 60 * 1000;
   const UNKNOWN_SPECIES_LABEL = "Unknown Birdo";
   const SPECIES_FILTER_IDENTIFIED = "Identified only";
+  const SPECIES_FILTER_NOT_COLLECTED = "__not_collected__";
   const LEGACY_SPECIES_FILTER_UNKNOWN = "Unknown";
 
   function isUnknownSpeciesLabel(name) {
@@ -890,7 +950,8 @@
   var headerStatusTimer = null;
   var HEADER_STATUS_EXPIRY_MS = 5000;
 
-  function setHeaderStatus(msg, isError) {
+  function setHeaderStatus(msg, isError, opts) {
+    opts = opts || {};
     if (!headerStatus) return;
     if (headerStatusTimer) {
       clearTimeout(headerStatusTimer);
@@ -898,14 +959,22 @@
     }
     headerStatus.textContent = msg || "";
     headerStatus.classList.toggle("error", !!isError);
+    headerStatus.classList.toggle("youtube-limit", !!opts.youtubeLimit);
     headerStatus.style.display = msg ? "block" : "none";
-    if (msg) {
+    if (msg && !opts.persist) {
       headerStatusTimer = setTimeout(function () {
+        if (isYouTubeUploadBlocked()) {
+          setHeaderStatus(getYouTubeUploadBlockedMessage(), true, { persist: true, youtubeLimit: true });
+          return;
+        }
         headerStatus.textContent = "";
         headerStatus.classList.remove("error");
+        headerStatus.classList.remove("youtube-limit");
         headerStatus.style.display = "none";
         headerStatusTimer = null;
       }, HEADER_STATUS_EXPIRY_MS);
+    } else if (!msg) {
+      headerStatus.classList.remove("youtube-limit");
     }
   }
 
@@ -915,6 +984,9 @@
   var pendingYouTubeUploadRequest = null;
   var activeYouTubeUploadButton = null;
   var activeYouTubeUploadButtonLabel = "";
+  var youtubeUploadBlockedUntilMs = 0;
+  var youtubeUploadBlockedReason = "";
+  var youtubeUploadBlockedTimer = null;
   let loadMoreCursor = null;
   let hasMore = false;
   let activeVideo = null;
@@ -926,6 +998,190 @@
   var deferSpeciesFilterRefresh = false;
   var speciesFilterRefreshPending = false;
 
+  function parseRetryAfterSeconds(retryAfterValue) {
+    var raw = String(retryAfterValue || "").trim();
+    if (!raw) return 0;
+    if (/^\d+$/.test(raw)) {
+      var n = parseInt(raw, 10);
+      return isFinite(n) && n > 0 ? n : 0;
+    }
+    var dt = Date.parse(raw);
+    if (!isFinite(dt)) return 0;
+    var sec = Math.ceil((dt - Date.now()) / 1000);
+    return sec > 0 ? sec : 0;
+  }
+
+  function parseDurationHintSeconds(message) {
+    var text = String(message || "");
+    var match = text.match(/(?:in|after)\s+(\d+)\s*(second|minute|hour|day)s?/i);
+    if (!match) return 0;
+    var amount = parseInt(match[1], 10);
+    if (!isFinite(amount) || amount <= 0) return 0;
+    var unit = String(match[2] || "").toLowerCase();
+    if (unit === "day") return amount * 86400;
+    if (unit === "hour") return amount * 3600;
+    if (unit === "minute") return amount * 60;
+    return amount;
+  }
+
+  function formatDateTimeLocal(tsMs) {
+    if (!tsMs || !isFinite(tsMs)) return "";
+    var d = new Date(tsMs);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    });
+  }
+
+  function isYouTubeUploadLimitReason(reason) {
+    var r = String(reason || "").toLowerCase();
+    return r === "uploadlimitexceeded" ||
+      r === "dailylimitexceeded" ||
+      r === "dailylimitexceededunreg" ||
+      r === "quotaexceeded" ||
+      r === "userratelimitexceeded";
+  }
+
+  function isYouTubeUploadLimitError(err) {
+    if (!err) return false;
+    if (isYouTubeUploadLimitReason(err.youtubeReason)) return true;
+    var msg = String(err.message || "").toLowerCase();
+    return /uploadlimitexceeded|dailylimitexceeded|quotaexceeded|userratelimitexceeded|exceeded the number of videos/i.test(msg);
+  }
+
+  function computeYouTubeUploadBlockedUntilMs(err) {
+    var retryAfterSec = err && typeof err.retryAfterSeconds === "number" ? err.retryAfterSeconds : 0;
+    if (retryAfterSec > 0) return Date.now() + retryAfterSec * 1000;
+    var hintedSec = parseDurationHintSeconds(err && err.message);
+    if (hintedSec > 0) return Date.now() + hintedSec * 1000;
+    if (err && String(err.youtubeReason || "").toLowerCase() === "dailylimitexceeded") {
+      var midnight = new Date();
+      midnight.setHours(24, 0, 0, 0);
+      return midnight.getTime();
+    }
+    return Date.now() + 24 * 60 * 60 * 1000;
+  }
+
+  function extractYouTubeReasonFromText(text) {
+    var t = String(text || "");
+    var m = t.match(/\[reason:\s*([^\]]+)\]/i);
+    if (m && m[1]) return String(m[1]).trim();
+    return "";
+  }
+
+  function getYouTubeUploadBlockedMessage() {
+    var reason = extractYouTubeReasonFromText(youtubeUploadBlockedReason);
+    if (!youtubeUploadBlockedUntilMs) {
+      return reason
+        ? "No more Save to YouTube right now. YouTube limit hit (" + reason + ")."
+        : "No more Save to YouTube right now. YouTube upload limit reached.";
+    }
+    var when = formatDateTimeLocal(youtubeUploadBlockedUntilMs);
+    if (!when) {
+      return reason
+        ? "No more Save to YouTube right now. YouTube limit hit (" + reason + ")."
+        : "No more Save to YouTube right now. YouTube upload limit reached.";
+    }
+    return reason
+      ? "No more Save to YouTube until about " + when + " (" + reason + ")."
+      : "No more Save to YouTube until about " + when + ".";
+  }
+
+  function isYouTubeUploadBlocked() {
+    if (!youtubeUploadBlockedUntilMs) return false;
+    if (Date.now() >= youtubeUploadBlockedUntilMs) {
+      if (youtubeUploadBlockedTimer) {
+        clearTimeout(youtubeUploadBlockedTimer);
+        youtubeUploadBlockedTimer = null;
+      }
+      youtubeUploadBlockedUntilMs = 0;
+      youtubeUploadBlockedReason = "";
+      localStorage.removeItem(STORAGE_KEYS.youtubeUploadBlockedUntil);
+      localStorage.removeItem(STORAGE_KEYS.youtubeUploadBlockedReason);
+      return false;
+    }
+    return true;
+  }
+
+  function applyYouTubeUploadBlockedUi() {
+    var blocked = isYouTubeUploadBlocked();
+    var msg = blocked ? getYouTubeUploadBlockedMessage() : "";
+    mediaGrid.querySelectorAll("button[data-save-youtube-button='true']").forEach(function (btn) {
+      var hasVideo = btn.getAttribute("data-has-video") === "true";
+      if (!hasVideo) {
+        btn.disabled = true;
+        btn.setAttribute("aria-disabled", "true");
+        btn.title = "No MP4 video available in this postcard.";
+        return;
+      }
+      if (blocked) {
+        btn.disabled = true;
+        btn.setAttribute("aria-disabled", "true");
+        btn.title = msg;
+      } else if (!btn.classList.contains("btn-uploading")) {
+        btn.disabled = false;
+        btn.removeAttribute("aria-disabled");
+        btn.title = "";
+      }
+    });
+    if (blocked) {
+      setHeaderStatus(msg, true, { persist: true, youtubeLimit: true });
+    } else if (headerStatus && headerStatus.classList.contains("youtube-limit")) {
+      setHeaderStatus("", false);
+    }
+  }
+
+  function scheduleYouTubeUploadBlockedUiRefresh() {
+    if (youtubeUploadBlockedTimer) {
+      clearTimeout(youtubeUploadBlockedTimer);
+      youtubeUploadBlockedTimer = null;
+    }
+    if (!isYouTubeUploadBlocked()) return;
+    var delay = youtubeUploadBlockedUntilMs - Date.now() + 250;
+    if (!isFinite(delay) || delay < 500) delay = 500;
+    if (delay > 2147483647) delay = 2147483647;
+    youtubeUploadBlockedTimer = setTimeout(function () {
+      youtubeUploadBlockedTimer = null;
+      applyYouTubeUploadBlockedUi();
+      if (isYouTubeUploadBlocked()) scheduleYouTubeUploadBlockedUiRefresh();
+    }, delay);
+  }
+
+  function blockYouTubeUploadsUntil(untilMs, reason) {
+    var next = Number(untilMs) || 0;
+    if (!isFinite(next) || next <= Date.now()) next = Date.now() + 24 * 60 * 60 * 1000;
+    youtubeUploadBlockedUntilMs = next;
+    youtubeUploadBlockedReason = String(reason || "").trim();
+    localStorage.setItem(STORAGE_KEYS.youtubeUploadBlockedUntil, String(youtubeUploadBlockedUntilMs));
+    if (youtubeUploadBlockedReason) {
+      localStorage.setItem(STORAGE_KEYS.youtubeUploadBlockedReason, youtubeUploadBlockedReason);
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.youtubeUploadBlockedReason);
+    }
+    applyYouTubeUploadBlockedUi();
+    scheduleYouTubeUploadBlockedUiRefresh();
+  }
+
+  function restoreYouTubeUploadBlockedState() {
+    var storedUntil = parseInt(localStorage.getItem(STORAGE_KEYS.youtubeUploadBlockedUntil) || "0", 10);
+    youtubeUploadBlockedReason = String(localStorage.getItem(STORAGE_KEYS.youtubeUploadBlockedReason) || "");
+    youtubeUploadBlockedUntilMs = isFinite(storedUntil) ? storedUntil : 0;
+    if (!isYouTubeUploadBlocked()) {
+      youtubeUploadBlockedUntilMs = 0;
+      youtubeUploadBlockedReason = "";
+      if (youtubeUploadBlockedTimer) {
+        clearTimeout(youtubeUploadBlockedTimer);
+        youtubeUploadBlockedTimer = null;
+      }
+    } else {
+      scheduleYouTubeUploadBlockedUiRefresh();
+    }
+  }
+
   function setBusy(on) {
     busy = !!on;
     loginBtn.disabled = busy;
@@ -936,16 +1192,33 @@
     if (downloadAllMediaBtn) downloadAllMediaBtn.disabled = busy;
   }
 
+  function isElementVisible(el) {
+    return !!(el && !el.hidden && el.style.display !== "none");
+  }
+
   function getDisplayedCounts() {
     var groups = mediaGrid.querySelectorAll(".postcard-group");
     var links = mediaGrid.querySelectorAll(".media-link");
     return { postcards: groups.length, media: links.length };
   }
 
+  function getVisibleCounts() {
+    var postcards = 0;
+    var media = 0;
+    mediaGrid.querySelectorAll(".postcard-group").forEach(function (group) {
+      if (!isElementVisible(group)) return;
+      postcards += 1;
+      media += group.querySelectorAll(".media-link").length;
+    });
+    return { postcards: postcards, media: media };
+  }
+
   function updateFooter() {
-    var c = getDisplayedCounts();
+    refreshSpeciesFilterBar();
+    var visible = getVisibleCounts();
+    var total = getDisplayedCounts();
     if (footerStats) {
-      footerStats.innerHTML = c.postcards + " postcard" + (c.postcards === 1 ? "" : "s") + " displayed" + (c.media > 0 ? " <span class=\"muted\">(" + c.media + " media)</span>" : "");
+      footerStats.innerHTML = visible.postcards + " postcard" + (visible.postcards === 1 ? "" : "s") + " displayed" + (visible.media > 0 ? " <span class=\"muted\">(" + visible.media + " media)</span>" : "");
     }
     if (footerActions && loadMoreBtn && loadAllBtn && downloadAllMediaBtn) {
       if (hasMore) {
@@ -955,14 +1228,14 @@
       } else {
         loadMoreBtn.hidden = true;
         loadAllBtn.hidden = true;
-        downloadAllMediaBtn.hidden = c.media === 0;
+        downloadAllMediaBtn.hidden = total.media === 0;
       }
     }
     if (downloadAllBtn) {
-      downloadAllBtn.hidden = hasMore || getDisplayedCounts().media === 0;
+      downloadAllBtn.hidden = hasMore || total.media === 0;
     }
     refreshCameraInfoBar();
-    refreshSpeciesFilterBar();
+    applyYouTubeUploadBlockedUi();
   }
 
   function cameraDisplayName(camera) {
@@ -1046,8 +1319,7 @@
       card.appendChild(meta);
       card.addEventListener("click", function () {
         cameraFilter = cameraFilter === cameraId ? "All" : cameraId;
-        buildCameraInfoBar();
-        applySpeciesFilter();
+        updateFooter();
       });
       cameraInfoBar.appendChild(card);
     }
@@ -1056,9 +1328,15 @@
     allCameras.forEach(function (c) {
       if (String(c.state || "").toUpperCase() === "ONLINE") onlineCount += 1;
     });
+    var visibleCounts = getVisibleCounts();
+    var totalCounts = getDisplayedCounts();
+    var postcardLine = visibleCounts.postcards + " postcard(s) displayed";
+    if (totalCounts.postcards !== visibleCounts.postcards) {
+      postcardLine += " of " + totalCounts.postcards + " loaded";
+    }
     addCard("All cameras (" + allCameras.length + ")", [
       onlineCount + " online",
-      getDisplayedCounts().postcards + " postcard(s) loaded"
+      postcardLine
     ], "All");
 
     allCameras.forEach(function (camera) {
@@ -1201,9 +1479,12 @@
     groups.forEach(function (el) {
       var dataSpecies = (el.getAttribute("data-species") || "").trim();
       var dataCameraId = (el.getAttribute("data-camera-id") || "").trim();
+      var dataCollected = (el.getAttribute("data-collected") || "") === "1";
       var show = true;
       if (speciesFilter === null || speciesFilter === "All") {
         show = true;
+      } else if (speciesFilter === SPECIES_FILTER_NOT_COLLECTED) {
+        show = !dataCollected;
       } else if (speciesFilter === SPECIES_FILTER_IDENTIFIED) {
         show = dataSpecies !== "" && !isUnknownSpeciesLabel(dataSpecies);
       } else if (speciesFilter === LEGACY_SPECIES_FILTER_UNKNOWN || isUnknownSpeciesLabel(speciesFilter)) {
@@ -1243,12 +1524,16 @@
       chip.dataset.filter = value;
       chip.addEventListener("click", function () {
         speciesFilter = speciesFilter === value ? "All" : value;
-        buildSpeciesFilterBar();
-        applySpeciesFilter();
+        updateFooter();
       });
       speciesFilterBar.appendChild(chip);
     }
+    var notCollectedCount = 0;
+    allPostcards.forEach(function (p) {
+      if (!isPostcardCollected(p)) notCollectedCount += 1;
+    });
     addChip("All", "All");
+    addChip("Not Collected (" + notCollectedCount + ")", SPECIES_FILTER_NOT_COLLECTED);
     var hasUnknown = unique.some(function (name) { return isUnknownSpeciesLabel(name); });
     if (hasUnknown) {
       addChip(SPECIES_FILTER_IDENTIFIED, SPECIES_FILTER_IDENTIFIED);
@@ -1368,7 +1653,16 @@
   }
 
   function isRetryableGraphqlEndpointStatus(status) {
-    return status === 404 || status === 405 || status === 500 || status === 502 || status === 503 || status === 504;
+    return status === 400 ||
+      status === 403 ||
+      status === 404 ||
+      status === 405 ||
+      status === 408 ||
+      status === 429 ||
+      status === 500 ||
+      status === 502 ||
+      status === 503 ||
+      status === 504;
   }
 
   function makeGraphqlConnectivityError(cause, attemptedEndpoints) {
@@ -1506,6 +1800,15 @@
     return /already.*collect|already saved|already in collection/i.test(msg || "");
   }
 
+  function normalizeCollectionErrorMessage(msg) {
+    var text = String(msg || "");
+    if (!text) return "Save to collection failed";
+    if (/youtube\.thumbnail|custom video thumbnails/i.test(text)) {
+      return "Save to collection is hitting a non-BirdBuddy endpoint. Clear any bb_graphql override and retry.";
+    }
+    return text;
+  }
+
   function shouldFallbackCollectMutation(msg) {
     if (!msg) return false;
     return /Cannot query field\s+\"?postcardCollect\"?/i.test(msg) ||
@@ -1564,9 +1867,21 @@
       var attempt = attempts[index];
       return bbGraphql(attempt.request, bbToken).then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (data) {
+          var collected = extractCollectedPostcardFromCollectResponse(data);
           var errMsg = "";
           if (data && data.errors && data.errors.length) errMsg = data.errors[0].message || "";
           if (!errMsg && !r.ok) errMsg = getGraphqlErrorMessage(data, r);
+          if (collected) {
+            var savedMediaCountFromCollected = Array.isArray(collected.medias)
+              ? collected.medias.length
+              : (Array.isArray(postcard && postcard.medias) ? postcard.medias.length : 0);
+            return {
+              alreadyCollected: isAlreadyCollectedError(errMsg),
+              collectedPostcard: collected,
+              savedMediaCount: savedMediaCountFromCollected,
+              shareToCommunity: shareToCommunity
+            };
+          }
           if (errMsg) {
             if (isAlreadyCollectedError(errMsg)) {
               return {
@@ -1581,9 +1896,8 @@
               fallbackErr.tryNextMutation = true;
               throw fallbackErr;
             }
-            throw new Error(errMsg);
+            throw new Error(normalizeCollectionErrorMessage(errMsg));
           }
-          var collected = extractCollectedPostcardFromCollectResponse(data);
           var savedMediaCount = collected && Array.isArray(collected.medias)
             ? collected.medias.length
             : (Array.isArray(postcard && postcard.medias) ? postcard.medias.length : 0);
@@ -1595,7 +1909,7 @@
           };
         });
       }).catch(function (e) {
-        var msg = e && e.message ? e.message : "Save to collection failed";
+        var msg = normalizeCollectionErrorMessage(e && e.message ? e.message : "Save to collection failed");
         if (attempt.allowFallback && index < attempts.length - 1 &&
             ((e && e.tryNextMutation) || shouldFallbackCollectMutation(msg))) {
           return executeAttempt(index + 1, msg);
@@ -2105,6 +2419,7 @@
         saveBtn.textContent = isCollected ? "Saved to collection" : "Save to collection";
       }
     });
+    updateFooter();
   }
 
   function findCollectionSaveButton(postcardId) {
@@ -2249,6 +2564,12 @@
       footer.appendChild(meta);
       var actions = document.createElement("div");
       actions.className = "postcard-group-actions";
+      var downloadPostcardBtn = document.createElement("button");
+      downloadPostcardBtn.type = "button";
+      downloadPostcardBtn.className = "btn";
+      downloadPostcardBtn.textContent = "Download Postcard";
+      downloadPostcardBtn.dataset.postcardId = postcard.id || "";
+      downloadPostcardBtn.addEventListener("click", function () { onDownloadPostcard(postcard, downloadPostcardBtn); });
       var saveCollectionBtn = document.createElement("button");
       saveCollectionBtn.type = "button";
       saveCollectionBtn.className = "btn btn-primary";
@@ -2259,11 +2580,23 @@
       saveCollectionBtn.disabled = collectedState;
       saveCollectionBtn.addEventListener("click", function () { onSaveToCollection(postcard, saveCollectionBtn); });
       var saveYoutubeBtn = document.createElement("button");
+      var hasVideoMedia = postcardHasVideoMedia(postcard);
       saveYoutubeBtn.type = "button";
       saveYoutubeBtn.className = "btn";
       saveYoutubeBtn.textContent = "Save to YouTube";
       saveYoutubeBtn.dataset.postcardId = postcard.id || "";
+      saveYoutubeBtn.setAttribute("data-save-youtube-button", "true");
+      saveYoutubeBtn.setAttribute("data-has-video", hasVideoMedia ? "true" : "false");
+      saveYoutubeBtn.disabled = !hasVideoMedia || isYouTubeUploadBlocked();
+      if (!hasVideoMedia) {
+        saveYoutubeBtn.setAttribute("aria-disabled", "true");
+        saveYoutubeBtn.title = "No MP4 video available in this postcard.";
+      } else if (isYouTubeUploadBlocked()) {
+        saveYoutubeBtn.setAttribute("aria-disabled", "true");
+        saveYoutubeBtn.title = getYouTubeUploadBlockedMessage();
+      }
       saveYoutubeBtn.addEventListener("click", function () { onSaveToYouTube(postcard, saveYoutubeBtn); });
+      actions.appendChild(downloadPostcardBtn);
       actions.appendChild(saveCollectionBtn);
       actions.appendChild(saveYoutubeBtn);
       footer.appendChild(actions);
@@ -2431,6 +2764,71 @@
     return triggerDownloadsSequentially(mediaGrid.querySelectorAll(".media-link"), 400);
   }
 
+  function getMediaLinksForPostcard(postcardId) {
+    var targetId = String(postcardId || "").trim();
+    if (!targetId) return [];
+    var links = [];
+    mediaGrid.querySelectorAll(".postcard-group").forEach(function (group) {
+      if ((group.getAttribute("data-postcard-id") || "") !== targetId) return;
+      group.querySelectorAll(".media-link").forEach(function (a) {
+        links.push(a);
+      });
+    });
+    return links;
+  }
+
+  function triggerDownloadsForPostcard(postcard, delayMs) {
+    var postcardId = postcard && postcard.id ? String(postcard.id) : "";
+    if (!postcardId) return Promise.resolve();
+    var links = getMediaLinksForPostcard(postcardId);
+    if (!links.length) return Promise.resolve();
+    return triggerDownloadsSequentially(links, delayMs || 350);
+  }
+
+  function setPostcardDownloadButtonUploading(button, label) {
+    if (!button) return;
+    button.classList.add("btn-uploading");
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = label || "Downloading…";
+  }
+
+  function resetPostcardDownloadButton(button) {
+    if (!button) return;
+    button.classList.remove("btn-uploading");
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    button.textContent = "Download Postcard";
+  }
+
+  function onDownloadPostcard(postcard, button) {
+    if (!postcard || !postcard.id) return;
+    if (busy) return;
+    var links = getMediaLinksForPostcard(postcard.id);
+    if (!links.length) {
+      setHeaderStatus("No media in this postcard.", true);
+      return;
+    }
+    setBusy(true);
+    mediaError.hidden = true;
+    mediaStatus.hidden = false;
+    mediaStatus.textContent = "Downloading postcard media…";
+    setPostcardDownloadButtonUploading(button, "Downloading…");
+    triggerDownloadsForPostcard(postcard, 350)
+      .then(function () {
+        mediaStatus.hidden = true;
+        setHeaderStatus("Download started for postcard media. Check your browser downloads.", false);
+      })
+      .catch(function (e) {
+        mediaStatus.hidden = true;
+        setHeaderStatus((e && e.message) || "Postcard download failed.", true);
+      })
+      .finally(function () {
+        resetPostcardDownloadButton(button);
+        setBusy(false);
+      });
+  }
+
   function onSaveToCollection(postcard, button) {
     if (!postcard || !postcard.id) return;
     var saveButton = button || findCollectionSaveButton(postcard.id);
@@ -2501,6 +2899,17 @@
     return out;
   }
 
+  function getPostcardVideoMedia(postcard) {
+    var medias = postcard && Array.isArray(postcard.medias) ? postcard.medias : [];
+    return medias.filter(function (m) {
+      return !!(m && m.isVideo && m.url);
+    });
+  }
+
+  function postcardHasVideoMedia(postcard) {
+    return getPostcardVideoMedia(postcard).length > 0;
+  }
+
   function getMediaDownloadPath(m) {
     if (!m || !m.url) return "—";
     try {
@@ -2522,6 +2931,163 @@
     if (t.length <= maxChars) return t;
     if (maxChars <= 3) return t.slice(0, maxChars);
     return t.slice(0, maxChars - 3).trimEnd() + "...";
+  }
+
+  function utf8ByteLength(text) {
+    var value = String(text || "");
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(value).length;
+    }
+    try {
+      return unescape(encodeURIComponent(value)).length;
+    } catch (_) {
+      return value.length;
+    }
+  }
+
+  function clampUtf8Bytes(text, maxBytes) {
+    var value = String(text || "");
+    if (maxBytes <= 0) return "";
+    if (utf8ByteLength(value) <= maxBytes) return value;
+    var low = 0;
+    var high = value.length;
+    while (low < high) {
+      var mid = Math.ceil((low + high) / 2);
+      var candidate = value.slice(0, mid);
+      if (utf8ByteLength(candidate) <= maxBytes) {
+        low = mid;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return value.slice(0, low);
+  }
+
+  function sanitizeYouTubeTags(tags, maxTotalChars) {
+    var cleaned = [];
+    var seen = {};
+    var total = 0;
+    var limit = typeof maxTotalChars === "number" && maxTotalChars > 0 ? maxTotalChars : 500;
+    (Array.isArray(tags) ? tags : []).forEach(function (tag) {
+      var t = String(tag || "").replace(/[<>]/g, " ").replace(/\s+/g, " ").trim();
+      if (!t) return;
+      if (t.length > 60) t = t.slice(0, 60).trim();
+      var key = t.toLowerCase();
+      if (seen[key]) return;
+      var extra = (cleaned.length ? 1 : 0) + t.length;
+      if (total + extra > limit) return;
+      seen[key] = true;
+      cleaned.push(t);
+      total += extra;
+    });
+    return cleaned;
+  }
+
+  function sanitizeYouTubeMetadata(metadata) {
+    var m = metadata && typeof metadata === "object" ? metadata : {};
+    var snippet = m.snippet && typeof m.snippet === "object" ? m.snippet : {};
+    var status = m.status && typeof m.status === "object" ? m.status : {};
+    var privacy = String(status.privacyStatus || "public").toLowerCase();
+    if (privacy !== "public" && privacy !== "private" && privacy !== "unlisted") privacy = "public";
+    var outSnippet = {
+      title: clampYouTubeTitle(snippet.title || "GetBirds postcard")
+    };
+    var description = clampChars(snippet.description || "", 5000);
+    description = clampUtf8Bytes(description, 5000).trim();
+    if (description) outSnippet.description = description;
+    var tags = sanitizeYouTubeTags(snippet.tags || [], 450);
+    if (tags.length) outSnippet.tags = tags;
+    outSnippet.categoryId = String(snippet.categoryId || "22").trim() || "22";
+    var outStatus = {
+      privacyStatus: privacy
+    };
+    if (typeof status.selfDeclaredMadeForKids === "boolean") {
+      outStatus.selfDeclaredMadeForKids = status.selfDeclaredMadeForKids;
+    }
+    return {
+      snippet: outSnippet,
+      status: outStatus
+    };
+  }
+
+  function buildYouTubeInsertMetadataAttempts(metadata) {
+    var safe = sanitizeYouTubeMetadata(metadata);
+    var attempts = [];
+    attempts.push(safe);
+    attempts.push({
+      snippet: {
+        title: safe.snippet.title,
+        description: safe.snippet.description || "",
+        categoryId: safe.snippet.categoryId || "22"
+      },
+      status: safe.status
+    });
+    attempts.push({
+      snippet: {
+        title: safe.snippet.title,
+        categoryId: safe.snippet.categoryId || "22"
+      },
+      status: {
+        privacyStatus: safe.status.privacyStatus
+      }
+    });
+    attempts.push({
+      snippet: {
+        title: safe.snippet.title
+      },
+      status: {
+        privacyStatus: safe.status.privacyStatus
+      }
+    });
+    return attempts;
+  }
+
+  function buildCompactYouTubeMetadata(metadata) {
+    var normalized = sanitizeYouTubeMetadata(metadata);
+    var compact = {
+      snippet: {
+        title: clampYouTubeTitle(normalized.snippet.title || "GetBirds postcard")
+      }
+    };
+    if (!compact.snippet.title) {
+      compact.snippet.title = "GetBirds postcard";
+    }
+    return compact;
+  }
+
+  function buildUploadBootstrapMetadata(metadata) {
+    var normalized = sanitizeYouTubeMetadata(metadata);
+    return {
+      snippet: {
+        title: clampYouTubeTitle(normalized.snippet.title || "GetBirds postcard")
+      }
+    };
+  }
+
+  function buildUltraMinimalUploadMetadata(metadata) {
+    var normalized = sanitizeYouTubeMetadata(metadata);
+    return {
+      snippet: {
+        title: clampYouTubeTitle(normalized.snippet.title || "GetBirds postcard")
+      }
+    };
+  }
+
+  function buildPublishOnlyMetadata(metadata) {
+    var normalized = sanitizeYouTubeMetadata(metadata);
+    var out = {
+      snippet: {
+        title: clampYouTubeTitle(normalized.snippet.title || "GetBirds postcard"),
+        categoryId: String(normalized.snippet.categoryId || "22")
+      },
+      status: {
+        privacyStatus: String(normalized.status.privacyStatus || "public")
+      }
+    };
+    if (typeof normalized.status.selfDeclaredMadeForKids === "boolean") {
+      out.status.selfDeclaredMadeForKids = normalized.status.selfDeclaredMadeForKids;
+    }
+    return out;
   }
 
   function normalizeSpeciesListForYouTube(postcard) {
@@ -2786,54 +3352,99 @@
     return { title: title, description: description, tags: tags };
   }
 
-  /** Sample-style multipart/mixed upload (no gapi/iframe). Uses fetch + GSI token. */
-  function uploadOneVideoMultipart(blob, metadata, accessToken) {
-    var boundary = "-------" + Math.random().toString(36).slice(2, 12);
-    var delimiter = "\r\n--" + boundary + "\r\n";
-    var closeDelim = "\r\n--" + boundary + "--";
+  function uploadOneVideoMultipartOnce(blob, metadata, accessToken) {
+    var boundary = "ytboundary" + Math.random().toString(36).slice(2, 14);
     var contentType = blob.type || "video/mp4";
-    return new Promise(function (resolve, reject) {
-      var reader = new FileReader();
-      reader.onload = function () {
-        var metadataPart = JSON.stringify(metadata);
-        var base64Media = typeof btoa !== "undefined" ? btoa(reader.result) : "";
-        var multipartRequestBody =
-          delimiter +
-          "Content-Type: application/json\r\n\r\n" +
-          metadataPart +
-          delimiter +
-          "Content-Type: " + contentType + "\r\n" +
-          "Content-Transfer-Encoding: base64\r\n\r\n" +
-          base64Media +
-          closeDelim;
-        var url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status";
-        fetch(url, {
-          method: "POST",
-          headers: {
-            "Authorization": "Bearer " + accessToken,
-            "Content-Type": "multipart/mixed; boundary=" + boundary
-          },
-          body: multipartRequestBody
-        })
-          .then(function (res) {
-            if (!res.ok) return res.text().then(function (t) { reject(new Error(t || "Upload failed")); });
-            return res.json();
-          })
-          .then(resolve)
-          .catch(reject);
-      };
-      reader.onerror = function () { reject(new Error("Failed to read video")); };
-      reader.readAsBinaryString(blob);
+    var prefix =
+      "--" + boundary + "\r\n" +
+      "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+      JSON.stringify(metadata) + "\r\n" +
+      "--" + boundary + "\r\n" +
+      "Content-Type: " + contentType + "\r\n\r\n";
+    var suffix = "\r\n--" + boundary + "--\r\n";
+    var body = new Blob([prefix, blob, suffix], { type: "multipart/related; boundary=" + boundary });
+    var url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=multipart&part=snippet,status";
+    return fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + accessToken,
+        "Content-Type": "multipart/related; boundary=" + boundary
+      },
+      body: body
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        if (!res.ok) {
+          var details = parseYouTubeApiErrorDetails(text, "YouTube upload failed.");
+          var err = new Error(details.message);
+          err.status = res.status;
+          err.raw = text;
+          err.youtubeReason = details.reason || "";
+          err.youtubeCode = details.code || 0;
+          err.retryAfterSeconds = parseRetryAfterSeconds(res.headers && res.headers.get ? res.headers.get("Retry-After") : "");
+          throw err;
+        }
+        if (!text) return {};
+        try {
+          return JSON.parse(text);
+        } catch (_) {
+          return {};
+        }
+      });
     });
   }
 
-  function parseYouTubeApiError(text, fallbackMessage) {
-    if (!text) return fallbackMessage || "YouTube API request failed.";
+  /** Upload with progressive metadata fallbacks for strict videos.insert validation. */
+  async function uploadOneVideoMultipart(blob, metadata, accessToken) {
+    var attempts = buildYouTubeInsertMetadataAttempts(metadata);
+    var lastErr = null;
+    for (var i = 0; i < attempts.length; i++) {
+      try {
+        var result = await uploadOneVideoMultipartOnce(blob, attempts[i], accessToken);
+        if (result && typeof result === "object") {
+          result.__metadataAttempt = i;
+          result.__usedFallback = i > 0;
+        }
+        return result;
+      } catch (err) {
+        lastErr = err;
+        if (isYouTubeUploadLimitError(err)) throw err;
+        var isBadRequest = err && Number(err.status) === 400;
+        if (!isBadRequest || i === attempts.length - 1) throw err;
+      }
+    }
+    throw lastErr || new Error("YouTube upload failed.");
+  }
+
+  function parseYouTubeApiErrorDetails(text, fallbackMessage) {
+    var out = {
+      message: fallbackMessage || "YouTube API request failed.",
+      reason: "",
+      code: 0
+    };
+    if (!text) return out;
     try {
       var data = JSON.parse(text);
-      if (data && data.error && data.error.message) return data.error.message;
+      if (data && data.error) {
+        var errObj = data.error;
+        out.code = Number(errObj.code) || 0;
+        out.message = errObj.message || out.message;
+        var first = Array.isArray(errObj.errors) && errObj.errors.length ? errObj.errors[0] : null;
+        if (first) {
+          if (first.reason) out.reason = String(first.reason);
+          if (!out.message && first.message) out.message = String(first.message);
+        }
+        if (out.reason && out.message.indexOf("[reason: ") === -1) {
+          out.message = out.message + " [reason: " + out.reason + "]";
+        }
+        if (out.message) return out;
+      }
     } catch (_) {}
-    return text || fallbackMessage || "YouTube API request failed.";
+    out.message = text || out.message;
+    return out;
+  }
+
+  function parseYouTubeApiError(text, fallbackMessage) {
+    return parseYouTubeApiErrorDetails(text, fallbackMessage).message;
   }
 
   function youtubeApiJson(url, opts, fallbackMessage) {
@@ -2849,6 +3460,23 @@
         }
       });
     });
+  }
+
+  function updateYouTubeVideoMetadata(accessToken, videoId, metadata) {
+    if (!accessToken || !videoId) return Promise.resolve({});
+    var safe = sanitizeYouTubeMetadata(metadata);
+    return youtubeApiJson("https://www.googleapis.com/youtube/v3/videos?part=snippet,status", {
+      method: "PUT",
+      headers: {
+        "Authorization": "Bearer " + accessToken,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        id: videoId,
+        snippet: safe.snippet,
+        status: safe.status
+      })
+    }, "Could not apply full YouTube metadata.");
   }
 
   function findGetBirdsPlaylistId(accessToken, playlistName) {
@@ -3099,7 +3727,7 @@
 
   function triggerVideoDownloadsForPostcard(postcard, delayMs) {
     delayMs = delayMs || 400;
-    var videos = postcard && postcard.medias ? postcard.medias.filter(function (m) { return m.isVideo; }) : [];
+    var videos = getPostcardVideoMedia(postcard);
     if (videos.length === 0) return Promise.resolve();
     var links = [];
     mediaGrid.querySelectorAll(".postcard-group").forEach(function (group) {
@@ -3132,11 +3760,25 @@
   function resetYouTubeUploadButtonState() {
     if (!activeYouTubeUploadButton) return;
     activeYouTubeUploadButton.classList.remove("btn-uploading");
-    activeYouTubeUploadButton.disabled = false;
     activeYouTubeUploadButton.removeAttribute("aria-busy");
     activeYouTubeUploadButton.textContent = activeYouTubeUploadButtonLabel || "Save to YouTube";
+    var hasVideo = activeYouTubeUploadButton.getAttribute("data-has-video") === "true";
+    if (!hasVideo) {
+      activeYouTubeUploadButton.disabled = true;
+      activeYouTubeUploadButton.setAttribute("aria-disabled", "true");
+      activeYouTubeUploadButton.title = "No MP4 video available in this postcard.";
+    } else if (isYouTubeUploadBlocked()) {
+      activeYouTubeUploadButton.disabled = true;
+      activeYouTubeUploadButton.setAttribute("aria-disabled", "true");
+      activeYouTubeUploadButton.title = getYouTubeUploadBlockedMessage();
+    } else {
+      activeYouTubeUploadButton.disabled = false;
+      activeYouTubeUploadButton.removeAttribute("aria-disabled");
+      activeYouTubeUploadButton.title = "";
+    }
     activeYouTubeUploadButton = null;
     activeYouTubeUploadButtonLabel = "";
+    applyYouTubeUploadBlockedUi();
   }
 
   function getStudioUrlForVideo(videoId) {
@@ -3181,7 +3823,7 @@
 
   /** Upload all postcard videos via multipart (sample-style). Uses GSI accessToken; no gapi/iframe. */
   async function uploadPostcardVideosWithToken(postcard, accessToken, requestCtx) {
-    var videos = postcard && postcard.medias ? postcard.medias.filter(function (m) { return m.isVideo; }) : [];
+    var videos = getPostcardVideoMedia(postcard);
     if (videos.length === 0) {
       setBusy(false);
       resetYouTubeUploadButtonState();
@@ -3191,6 +3833,7 @@
     var uploadedVideoIds = [];
     var playlistId = "";
     var playlistWarning = "";
+    var metadataWarning = "";
     var thumbnailWarning = "";
     var thumbnailBlob = null;
     try {
@@ -3245,6 +3888,15 @@
         var uploadResult = await uploadOneVideoMultipart(blob, metadata, accessToken);
         if (uploadResult && uploadResult.id) {
           uploadedVideoIds.push(uploadResult.id);
+          if (uploadResult.__usedFallback) {
+            try {
+              await updateYouTubeVideoMetadata(accessToken, uploadResult.id, metadata);
+            } catch (metadataErr) {
+              if (!metadataWarning) {
+                metadataWarning = metadataErr && metadataErr.message ? metadataErr.message : "Could not apply full YouTube metadata.";
+              }
+            }
+          }
           if (playlistId) {
             try {
               await addVideoToPlaylist(accessToken, playlistId, uploadResult.id);
@@ -3273,6 +3925,9 @@
       } else if (playlistWarning) {
         successPrefix += " (playlist step skipped)";
       }
+      if (metadataWarning) {
+        successPrefix += " (metadata simplified)";
+      }
       if (thumbnailBlob && !thumbnailWarning) {
         successPrefix += " with postcard thumbnail";
       } else if (thumbnailWarning) {
@@ -3285,7 +3940,11 @@
         openYouTubeUploadModal({ success: true, popupBlocked: true, count: videos.length, studioUrl: studioUrl });
       }
     } catch (e) {
-      if (isCORSOrNetworkError(e)) {
+      if (isYouTubeUploadLimitError(e)) {
+        var until = computeYouTubeUploadBlockedUntilMs(e);
+        blockYouTubeUploadsUntil(until, (e && e.message) || youtubeUploadBlockedReason);
+        setHeaderStatus(getYouTubeUploadBlockedMessage(), true, { persist: true, youtubeLimit: true });
+      } else if (isCORSOrNetworkError(e)) {
         setHeaderStatus("Upload from this browser was blocked. Downloading videos…", false);
         await triggerVideoDownloadsForPostcard(postcard, 350);
         openYouTubeUploadModal({ fallback: true, count: videos.length });
@@ -3329,9 +3988,18 @@
   }
 
   function onSaveToYouTube(postcard, button) {
-    var videos = postcard && postcard.medias ? postcard.medias.filter(function (m) { return m.isVideo; }) : [];
+    if (isYouTubeUploadBlocked()) {
+      applyYouTubeUploadBlockedUi();
+      return;
+    }
+    var videos = getPostcardVideoMedia(postcard);
     if (videos.length === 0) {
-      setHeaderStatus("No videos in this postcard.", true);
+      if (button) {
+        button.disabled = true;
+        button.setAttribute("aria-disabled", "true");
+        button.title = "No MP4 video available in this postcard.";
+      }
+      setHeaderStatus("No MP4 video in this postcard. Save to collection still works.", true);
       return;
     }
     if (busy) return;
@@ -3434,7 +4102,15 @@
   }
 
   function clearSession() {
-    Object.keys(STORAGE_KEYS).forEach(function (k) { localStorage.removeItem(STORAGE_KEYS[k]); });
+    [
+      STORAGE_KEYS.googleAccessToken,
+      STORAGE_KEYS.googleExpiresAt,
+      STORAGE_KEYS.picture,
+      STORAGE_KEYS.name,
+      STORAGE_KEYS.bbAccessToken,
+      STORAGE_KEYS.bbExpiresAt,
+      STORAGE_KEYS.bbRefreshToken
+    ].forEach(function (key) { localStorage.removeItem(key); });
   }
 
   async function signOut() {
@@ -3498,6 +4174,7 @@
   }
 
   syncGraphqlOverrideFromUrl();
+  restoreYouTubeUploadBlockedState();
 
   setBusy(true);
   restoreSession().then(function (ok) {
