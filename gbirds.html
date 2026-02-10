@@ -565,66 +565,71 @@
     }
 
     .camera-info-bar {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: center;
       gap: 0.75rem;
+      overflow-x: auto;
+      overflow-y: hidden;
+      white-space: nowrap;
+      scrollbar-width: thin;
+      -webkit-overflow-scrolling: touch;
     }
 
     .camera-info-bar.hidden { display: none; }
 
     .camera-info-bar-footer {
-      padding: 0.65rem 1.25rem 0.9rem;
+      padding: 0.45rem 1rem 0.6rem;
       border-top: 1px solid var(--border);
       background: var(--surface);
-      max-height: 34vh;
-      overflow: auto;
+      overflow: hidden;
     }
 
     .camera-card {
-      display: block;
-      width: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: auto;
       text-align: left;
-      padding: 0.65rem 0.75rem;
+      padding: 0.4rem 0.75rem;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      box-shadow: var(--shadow);
+      border-radius: 999px;
+      box-shadow: none;
       cursor: pointer;
-      transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+      transition: border-color 0.2s, background 0.2s, transform 0.2s;
       color: var(--text);
       font-family: inherit;
+      max-width: 260px;
+      overflow: hidden;
     }
 
     .camera-card:hover {
       border-color: var(--accent);
-      box-shadow: var(--shadow-hover);
+      background: var(--accent-light);
       transform: translateY(-1px);
     }
 
     .camera-card.active {
       border-color: var(--accent);
-      background: var(--accent-light);
+      background: var(--accent);
+      color: #fff;
     }
 
     .camera-card .camera-title {
-      font-size: 0.85rem;
+      font-size: 0.78rem;
       font-weight: 700;
-      color: var(--text);
-      margin-bottom: 0.35rem;
-      line-height: 1.25;
+      color: inherit;
+      margin: 0;
+      line-height: 1.15;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .camera-card .camera-meta {
-      font-size: 0.75rem;
-      color: var(--muted);
-      line-height: 1.35;
-      display: grid;
-      gap: 0.1rem;
-    }
-
-    .camera-card .camera-meta .camera-accent {
-      color: var(--text-soft);
-      font-weight: 600;
+      display: none;
     }
 
     .species-filter-bar {
@@ -838,6 +843,7 @@
   const BB_GRAPHQL = "https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql";
   const BB_GRAPHQL_OVERRIDE_KEY = "bb_graphql_override";
   const BB_GRAPHQL_OVERRIDE_QUERY_KEYS = ["bb_graphql", "bbGraphql", "graphql"];
+  const BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS = ["bb_graphql_direct", "bbGraphqlDirect"];
 
   const STORAGE_KEYS = {
     googleAccessToken: "google_access_token",
@@ -1296,13 +1302,6 @@
     cameraInfoBar.classList.remove("hidden");
     cameraInfoBar.innerHTML = "";
 
-    function addLine(parent, text, accent) {
-      var line = document.createElement("div");
-      line.textContent = text;
-      if (accent) line.className = "camera-accent";
-      parent.appendChild(line);
-    }
-
     function addCard(title, metaLines, cameraId) {
       var card = document.createElement("button");
       card.type = "button";
@@ -1311,12 +1310,13 @@
       titleEl.className = "camera-title";
       titleEl.textContent = title;
       card.appendChild(titleEl);
-      var meta = document.createElement("div");
-      meta.className = "camera-meta";
-      metaLines.forEach(function (line, idx) {
-        addLine(meta, line, idx === 0);
-      });
-      card.appendChild(meta);
+      var tooltip = (metaLines || []).join(" | ").trim();
+      if (tooltip) {
+        card.title = tooltip;
+        card.setAttribute("aria-label", title + " — " + tooltip);
+      } else {
+        card.setAttribute("aria-label", title);
+      }
       card.addEventListener("click", function () {
         cameraFilter = cameraFilter === cameraId ? "All" : cameraId;
         updateFooter();
@@ -1476,6 +1476,7 @@
   function applySpeciesFilter() {
     if (!mediaGrid) return;
     var groups = mediaGrid.querySelectorAll(".postcard-group");
+    var visibleCount = 0;
     groups.forEach(function (el) {
       var dataSpecies = (el.getAttribute("data-species") || "").trim();
       var dataCameraId = (el.getAttribute("data-camera-id") || "").trim();
@@ -1496,7 +1497,16 @@
         show = dataCameraId === "" || dataCameraId === cameraFilter;
       }
       el.style.display = show ? "" : "none";
+      if (show) visibleCount += 1;
     });
+    if (mediaEmpty && allPostcards.length > 0) {
+      if (visibleCount === 0) {
+        mediaEmpty.hidden = false;
+        mediaEmpty.textContent = "No postcards match the active filters.";
+      } else if (mediaEmpty.textContent === "No postcards match the active filters.") {
+        mediaEmpty.hidden = true;
+      }
+    }
   }
 
   function buildSpeciesFilterBar() {
@@ -1634,11 +1644,49 @@
     } catch (_) {}
   }
 
+  function isLocalDevOrigin() {
+    try {
+      var host = String(window.location.hostname || "").toLowerCase();
+      return host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "::1" ||
+        host === "[::1]" ||
+        /\.local$/.test(host);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function isDirectBirdBuddyEndpointUrl(urlLike) {
+    try {
+      var parsed = new URL(String(urlLike || ""), window.location.origin);
+      var host = String(parsed.hostname || "").toLowerCase();
+      return host === "graphql.app-api.prod.aws.mybirdbuddy.com";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function shouldAllowDirectBirdBuddyGraphql() {
+    try {
+      if (window.__GBIRDS_ALLOW_DIRECT_BB_GRAPHQL === true) return true;
+      var params = new URLSearchParams(window.location.search || "");
+      for (var i = 0; i < BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS.length; i++) {
+        var key = BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS[i];
+        var value = (params.get(key) || "").trim().toLowerCase();
+        if (value === "1" || value === "true" || value === "yes") return true;
+      }
+    } catch (_) {}
+    return !isLocalDevOrigin();
+  }
+
   function getGraphqlEndpointCandidates() {
     var out = [];
+    var allowDirect = shouldAllowDirectBirdBuddyGraphql();
     function push(urlLike) {
       var u = normalizeGraphqlEndpoint(urlLike);
       if (!u) return;
+      if (!allowDirect && isDirectBirdBuddyEndpointUrl(u)) return;
       if (out.indexOf(u) !== -1) return;
       out.push(u);
     }
@@ -1648,7 +1696,7 @@
 
     if (injected) push(injected);
     if (override) push(override);
-    push(BB_GRAPHQL);
+    if (allowDirect) push(BB_GRAPHQL);
     return out;
   }
 
@@ -1667,7 +1715,11 @@
 
   function makeGraphqlConnectivityError(cause, attemptedEndpoints) {
     var details = attemptedEndpoints && attemptedEndpoints.length ? (" Tried: " + attemptedEndpoints.join(", ")) : "";
-    var err = new Error("Could not reach BirdBuddy GraphQL from this page origin. Use ?bb_graphql=<proxy-url> or window.__GBIRDS_GRAPHQL_ENDPOINT to force a proxy endpoint." + details);
+    var guidance = "Could not reach BirdBuddy GraphQL from this page origin. Use ?bb_graphql=<proxy-url> or window.__GBIRDS_GRAPHQL_ENDPOINT to force a proxy endpoint.";
+    if (!shouldAllowDirectBirdBuddyGraphql()) {
+      guidance += " Direct BirdBuddy GraphQL is disabled on localhost to avoid CORS preflight failures.";
+    }
+    var err = new Error(guidance + details);
     err.isNetworkError = true;
     err.isCorsError = true;
     if (cause) err.cause = cause;
