@@ -763,6 +763,121 @@
       display: inline-block;
     }
     .modal-body .modal-actions .btn:hover { background: var(--accent-hover); }
+
+    .btn-tv {
+      padding: 0.4rem 0.5rem;
+      margin-left: 0.25rem;
+      border-radius: var(--radius-sm);
+      color: var(--text-soft);
+    }
+    .btn-tv:hover { color: var(--accent); }
+    .btn-tv .tv-icon { display: block; }
+
+    .getbirds-tv-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .getbirds-tv-overlay.hidden { display: none !important; }
+    .getbirds-tv-video {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .getbirds-tv-overlays {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 1rem 1.25rem;
+    }
+    .getbirds-tv-bug {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: rgba(255,255,255,0.85);
+      text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+      letter-spacing: 0.02em;
+    }
+    .getbirds-tv-banner {
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: rgba(255,255,255,0.7);
+      text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+      margin-bottom: 0.25rem;
+    }
+    .getbirds-tv-lower-third {
+      background: linear-gradient(90deg, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.5) 70%, transparent 100%);
+      color: #fff;
+      padding: 0.5rem 1rem 0.5rem 1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      max-width: 70%;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    }
+    .getbirds-tv-snipe {
+      position: absolute;
+      bottom: 4rem;
+      left: 1rem;
+      background: rgba(0,0,0,0.6);
+      color: rgba(255,255,255,0.9);
+      padding: 0.35rem 0.6rem;
+      font-size: 0.75rem;
+      border-radius: 4px;
+      max-width: 200px;
+      animation: getbirds-tv-snipe-in 0.3s ease-out;
+    }
+    @keyframes getbirds-tv-snipe-in {
+      from { opacity: 0; transform: translateX(-8px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+    .getbirds-tv-close {
+      position: absolute;
+      top: 1rem;
+      left: 1rem;
+      z-index: 10;
+      width: 2.5rem;
+      height: 2.5rem;
+      padding: 0;
+      font-size: 1.5rem;
+      line-height: 1;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .getbirds-tv-close:hover { background: rgba(0,0,0,0.75); color: #fff; }
+    .getbirds-tv-unmute {
+      position: absolute;
+      top: 1rem;
+      left: 3.5rem;
+      z-index: 10;
+      width: 2.5rem;
+      height: 2.5rem;
+      padding: 0;
+      font-size: 1.1rem;
+      line-height: 1;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .getbirds-tv-unmute:hover { background: rgba(0,0,0,0.75); color: #fff; }
+    .getbirds-tv-unmute.muted { opacity: 0.7; }
   </style>
 </head>
 <body>
@@ -786,6 +901,9 @@
         <div class="header-profile">
           <img id="avatar" class="avatar" src="" alt="" />
           <span class="header-title">GetBirds</span>
+          <button type="button" id="getbirdsTvBtn" class="btn btn-tv" title="GetBirds.TV — Live stream visible postcard videos" aria-label="Open GetBirds.TV">
+            <svg class="tv-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
+          </button>
         </div>
         <div id="headerStatus" class="header-status" aria-live="polite"></div>
         <div class="header-actions">
@@ -827,6 +945,18 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <div id="getbirdsTvOverlay" class="getbirds-tv-overlay hidden" aria-label="GetBirds.TV broadcast">
+    <video id="getbirdsTvVideo" class="getbirds-tv-video" autoplay muted playsinline></video>
+    <div class="getbirds-tv-overlays">
+      <div class="getbirds-tv-bug" aria-hidden="true">GetBirds.TV</div>
+      <div class="getbirds-tv-banner" aria-hidden="true">GetBirds.TV by HH5HH</div>
+      <div id="getbirdsTvLowerThird" class="getbirds-tv-lower-third" aria-hidden="true"></div>
+      <div id="getbirdsTvSnipe" class="getbirds-tv-snipe" aria-hidden="true"></div>
+    </div>
+    <button type="button" id="getbirdsTvUnmute" class="getbirds-tv-unmute" aria-label="Unmute">🔊</button>
+    <button type="button" id="getbirdsTvClose" class="getbirds-tv-close" aria-label="Close GetBirds.TV">×</button>
   </div>
 
   <script>
@@ -952,6 +1082,13 @@
   const youtubeModalMessage = $("youtubeModalMessage");
   const youtubeModalClose = $("youtubeModalClose");
   const youtubeModalOpenStudio = $("youtubeModalOpenStudio");
+  const getbirdsTvBtn = $("getbirdsTvBtn");
+  const getbirdsTvOverlay = $("getbirdsTvOverlay");
+  const getbirdsTvVideo = $("getbirdsTvVideo");
+  const getbirdsTvClose = $("getbirdsTvClose");
+  const getbirdsTvUnmute = $("getbirdsTvUnmute");
+  const getbirdsTvLowerThird = $("getbirdsTvLowerThird");
+  const getbirdsTvSnipe = $("getbirdsTvSnipe");
 
   var headerStatusTimer = null;
   var HEADER_STATUS_EXPIRY_MS = 5000;
@@ -1597,11 +1734,58 @@
     if (loginScreen) loginScreen.classList.remove("hidden");
   }
 
+  function getInitials(name) {
+    var s = String(name || "").trim();
+    if (!s) return "?";
+    var parts = s.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase().slice(0, 2);
+    return s[0].toUpperCase();
+  }
+
+  function getAvatarFallbackDataUri(initials) {
+    var letter = (initials || "?").slice(0, 2).toUpperCase();
+    var svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"44\" height=\"44\" viewBox=\"0 0 44 44\"><circle cx=\"22\" cy=\"22\" r=\"22\" fill=\"#d4cfc4\"/><text x=\"22\" y=\"28\" font-family=\"system-ui,sans-serif\" font-size=\"18\" font-weight=\"600\" fill=\"#6b6560\" text-anchor=\"middle\">" + letter + "</text></svg>";
+    return "data:image/svg+xml," + encodeURIComponent(svg);
+  }
+
+  function applyAvatarWithFallback(avatarEl, pictureUrl, name) {
+    if (!avatarEl) return;
+    var initials = getInitials(name);
+    avatarEl.alt = name ? "Profile: " + name : "Profile";
+    avatarEl.dataset.fallbackInitials = initials;
+    avatarEl.removeAttribute("data-avatar-retried");
+    var fallbackSrc = getAvatarFallbackDataUri(initials);
+    if (!pictureUrl || !pictureUrl.trim()) {
+      avatarEl.src = fallbackSrc;
+      avatarEl.onerror = null;
+      return;
+    }
+    avatarEl.onerror = function () {
+      if (avatarEl.dataset.avatarRetried) {
+        avatarEl.onerror = null;
+        avatarEl.src = getAvatarFallbackDataUri(avatarEl.dataset.fallbackInitials || "?");
+        return;
+      }
+      avatarEl.dataset.avatarRetried = "1";
+      var url = avatarEl.src;
+      setTimeout(function () {
+        if (avatarEl.src === url && avatarEl.dataset.avatarRetried) {
+          avatarEl.onerror = function () {
+            avatarEl.onerror = null;
+            avatarEl.src = getAvatarFallbackDataUri(avatarEl.dataset.fallbackInitials || "?");
+          };
+          avatarEl.src = url;
+        }
+      }, 1500);
+    };
+    avatarEl.src = pictureUrl.trim();
+  }
+
   function showLoggedIn(profile) {
+    if (!profile) return;
     loginScreen.classList.add("hidden");
     loggedInScreen.classList.remove("hidden");
-    avatar.src = profile.picture || "";
-    avatar.alt = profile.name ? "Profile: " + profile.name : "Profile";
+    applyAvatarWithFallback(avatar, profile.picture || "", profile.name || "");
     mediaGrid.innerHTML = "";
     loadMoreCursor = null;
     hasMore = false;
@@ -1669,15 +1853,15 @@
 
   function shouldAllowDirectBirdBuddyGraphql() {
     try {
-      if (window.__GBIRDS_ALLOW_DIRECT_BB_GRAPHQL === true) return true;
+      if (window.__GBIRDS_ALLOW_DIRECT_BB_GRAPHQL === false) return false;
       var params = new URLSearchParams(window.location.search || "");
       for (var i = 0; i < BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS.length; i++) {
         var key = BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS[i];
         var value = (params.get(key) || "").trim().toLowerCase();
-        if (value === "1" || value === "true" || value === "yes") return true;
+        if (value === "0" || value === "false" || value === "no") return false;
       }
     } catch (_) {}
-    return !isLocalDevOrigin();
+    return true;
   }
 
   function getGraphqlEndpointCandidates() {
@@ -4099,6 +4283,114 @@
     }
   }
 
+  /** Collect visible MP4s from the grid (honors species/camera filter). Returns { url, postcardId, species, createdAt }. */
+  function getVisibleVideoSegments() {
+    if (!mediaGrid) return [];
+    var segments = [];
+    mediaGrid.querySelectorAll(".postcard-group").forEach(function (group) {
+      if (group.style.display === "none") return;
+      var postcardId = group.getAttribute("data-postcard-id") || "";
+      var species = (group.getAttribute("data-species") || "").trim() || "—";
+      var postcard = allPostcards.filter(function (p) { return (p.id || "") === postcardId; })[0];
+      var createdAt = postcard && postcard.createdAt ? formatPostcardDate(postcard.createdAt) : "—";
+      group.querySelectorAll(".media-link").forEach(function (a) {
+        var name = (a.getAttribute("data-download-name") || a.getAttribute("download") || "").toLowerCase();
+        if (!/\.(mp4|webm|mov)$/.test(name)) return;
+        var url = a.getAttribute("data-media-url") || a.href || "";
+        if (url) segments.push({ url: url, postcardId: postcardId, species: species, createdAt: createdAt });
+      });
+    });
+    return segments;
+  }
+
+  var getbirdsTvSegments = [];
+  var getbirdsTvIndex = 0;
+  var getbirdsTvKeyHandler = null;
+
+  function playGetBirdsTvSegmentAtIndex(index) {
+    if (getbirdsTvSegments.length === 0 || !getbirdsTvVideo) return;
+    var n = getbirdsTvSegments.length;
+    getbirdsTvIndex = ((index % n) + n) % n;
+    var segment = getbirdsTvSegments[getbirdsTvIndex];
+    getbirdsTvVideo.src = segment.url;
+    getbirdsTvVideo.load();
+    updateGetBirdsTvOverlays(segment);
+    getbirdsTvVideo.play().catch(function () {});
+  }
+
+  function updateGetBirdsTvOverlays(segment) {
+    if (getbirdsTvLowerThird) {
+      getbirdsTvLowerThird.textContent = segment ? segment.species + " · " + segment.createdAt : "";
+      getbirdsTvLowerThird.style.display = segment ? "block" : "none";
+      getbirdsTvLowerThird.setAttribute("aria-hidden", segment ? "false" : "true");
+    }
+    if (getbirdsTvSnipe) {
+      var next = getbirdsTvSegments[getbirdsTvIndex + 1] || getbirdsTvSegments[0];
+      getbirdsTvSnipe.textContent = next ? "Up next: " + next.species : "";
+      getbirdsTvSnipe.style.display = next ? "block" : "none";
+      getbirdsTvSnipe.setAttribute("aria-hidden", next ? "false" : "true");
+    }
+  }
+
+  function playNextGetBirdsTvSegment() {
+    playGetBirdsTvSegmentAtIndex(getbirdsTvIndex);
+  }
+
+  function openGetBirdsTV() {
+    getbirdsTvSegments = getVisibleVideoSegments();
+    if (getbirdsTvSegments.length === 0) {
+      setHeaderStatus("No visible MP4s. Add postcards or change the filter.", true);
+      return;
+    }
+    if (!getbirdsTvOverlay || !getbirdsTvVideo) return;
+    getbirdsTvIndex = 0;
+    getbirdsTvOverlay.classList.remove("hidden");
+    updateGetBirdsTvUnmuteButton();
+    getbirdsTvVideo.onended = function () {
+      if (getbirdsTvSegments.length === 0) return;
+      getbirdsTvIndex = (getbirdsTvIndex + 1) % getbirdsTvSegments.length;
+      playNextGetBirdsTvSegment();
+    };
+    playNextGetBirdsTvSegment();
+    if (getbirdsTvSegments.length >= 2 && !getbirdsTvKeyHandler) {
+      getbirdsTvKeyHandler = function (e) {
+        if (!getbirdsTvOverlay || getbirdsTvOverlay.classList.contains("hidden")) return;
+        if (getbirdsTvSegments.length < 2) return;
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          playGetBirdsTvSegmentAtIndex(getbirdsTvIndex - 1);
+        } else if (e.key === "ArrowRight") {
+          e.preventDefault();
+          playGetBirdsTvSegmentAtIndex(getbirdsTvIndex + 1);
+        }
+      };
+      document.addEventListener("keydown", getbirdsTvKeyHandler);
+    }
+  }
+
+  function updateGetBirdsTvUnmuteButton() {
+    if (!getbirdsTvUnmute || !getbirdsTvVideo) return;
+    var muted = getbirdsTvVideo.muted;
+    getbirdsTvUnmute.textContent = muted ? "🔇" : "🔊";
+    getbirdsTvUnmute.classList.toggle("muted", muted);
+    getbirdsTvUnmute.setAttribute("aria-label", muted ? "Unmute" : "Mute");
+  }
+
+  function closeGetBirdsTV() {
+    if (getbirdsTvKeyHandler) {
+      document.removeEventListener("keydown", getbirdsTvKeyHandler);
+      getbirdsTvKeyHandler = null;
+    }
+    if (getbirdsTvOverlay) getbirdsTvOverlay.classList.add("hidden");
+    if (getbirdsTvVideo) {
+      getbirdsTvVideo.pause();
+      getbirdsTvVideo.removeAttribute("src");
+      getbirdsTvVideo.load();
+      getbirdsTvVideo.onended = null;
+    }
+    getbirdsTvSegments = [];
+  }
+
   function getTokenClient() {
     if (tokenClient) return tokenClient;
     if (typeof google === "undefined" || !google.accounts || !google.accounts.oauth2) {
@@ -4218,6 +4510,18 @@
 
   if (youtubeModalClose) {
     youtubeModalClose.addEventListener("click", closeYouTubeUploadModal);
+  }
+  if (getbirdsTvBtn) {
+    getbirdsTvBtn.addEventListener("click", function () { openGetBirdsTV(); });
+  }
+  if (getbirdsTvClose) {
+    getbirdsTvClose.addEventListener("click", closeGetBirdsTV);
+  }
+  if (getbirdsTvUnmute && getbirdsTvVideo) {
+    getbirdsTvUnmute.addEventListener("click", function () {
+      getbirdsTvVideo.muted = !getbirdsTvVideo.muted;
+      updateGetBirdsTvUnmuteButton();
+    });
   }
   if (youtubeUploadModalOverlay) {
     youtubeUploadModalOverlay.addEventListener("click", function (e) {
