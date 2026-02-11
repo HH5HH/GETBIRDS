@@ -1601,13 +1601,27 @@
     applySpeciesFilter();
   }
 
+  /** One entry per unique species (postcards can have multiple comma-separated species). */
   function getUniqueSpecies() {
     var set = {};
     allPostcards.forEach(function (p) {
       var label = formatSpeciesLabel(p);
-      set[label] = true;
+      if (!label || label === "—") {
+        set[UNKNOWN_SPECIES_LABEL] = true;
+        return;
+      }
+      label.split(/\s*,\s*/).forEach(function (part) {
+        var s = part.trim();
+        if (s) set[s] = true;
+      });
     });
     return Object.keys(set).sort();
+  }
+
+  function postcardSpeciesList(dataSpecies) {
+    var s = (dataSpecies || "").trim();
+    if (s === "" || s === "—") return [];
+    return s.split(/\s*,\s*/).map(function (p) { return p.trim(); }).filter(Boolean);
   }
 
   function applySpeciesFilter() {
@@ -1618,17 +1632,18 @@
       var dataSpecies = (el.getAttribute("data-species") || "").trim();
       var dataCameraId = (el.getAttribute("data-camera-id") || "").trim();
       var dataCollected = (el.getAttribute("data-collected") || "") === "1";
+      var speciesList = postcardSpeciesList(dataSpecies);
       var show = true;
       if (speciesFilter === null || speciesFilter === "All") {
         show = true;
       } else if (speciesFilter === SPECIES_FILTER_NOT_COLLECTED) {
         show = !dataCollected;
       } else if (speciesFilter === SPECIES_FILTER_IDENTIFIED) {
-        show = dataSpecies !== "" && !isUnknownSpeciesLabel(dataSpecies);
+        show = speciesList.some(function (name) { return !isUnknownSpeciesLabel(name); });
       } else if (speciesFilter === LEGACY_SPECIES_FILTER_UNKNOWN || isUnknownSpeciesLabel(speciesFilter)) {
-        show = dataSpecies === "" || isUnknownSpeciesLabel(dataSpecies);
+        show = speciesList.length === 0 || speciesList.some(function (name) { return isUnknownSpeciesLabel(name); });
       } else {
-        show = dataSpecies.split(/\s*,\s*/).indexOf(speciesFilter) !== -1;
+        show = speciesList.indexOf(speciesFilter) !== -1;
       }
       if (show && cameraFilter !== "All") {
         show = dataCameraId === "" || dataCameraId === cameraFilter;
