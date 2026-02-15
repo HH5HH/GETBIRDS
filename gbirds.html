@@ -1020,8 +1020,8 @@
   const CLIENT_ID = "1022751350446-o1m86gkguv2br1hfr1s2efau3aoj0jf2.apps.googleusercontent.com";
   /* Sign-in only: no restricted scopes so login does not get 403. */
   const SCOPE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
-  /* Requested only when user clicks Save to YouTube (incremental auth + playlist management). */
-  const SCOPE_YOUTUBE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube";
+  /* Requested only when user clicks Save to YouTube (upload, playlist, thumbnails). force-ssl can help thumbnail set. */
+  const SCOPE_YOUTUBE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/youtube.force-ssl";
   const USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
   const REVOKE_URL = "https://oauth2.googleapis.com/revoke";
   const BB_GRAPHQL = "https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql";
@@ -3993,7 +3993,12 @@
       body: thumbnailBlob
     }).then(function (res) {
       return res.text().then(function (text) {
-        if (!res.ok) throw new Error(parseYouTubeApiError(text, "Could not set YouTube thumbnail."));
+        if (!res.ok) {
+          var msg = parseYouTubeApiError(text, "Could not set YouTube thumbnail.");
+          var err = new Error(msg);
+          err.status = res.status;
+          throw err;
+        }
         if (!text) return {};
         try {
           return JSON.parse(text);
@@ -4005,6 +4010,7 @@
   }
 
   function isRetryableYouTubeThumbnailError(err) {
+    if (err && err.status === 403) return false;
     var msg = err && err.message ? String(err.message) : "";
     return /processing|process|not.?ready|video.?not.?found|notFound|try again|temporar/i.test(msg);
   }
@@ -4218,7 +4224,10 @@
               await setYouTubeVideoThumbnailWithRetry(accessToken, uploadResult.id, thumbnailBlob);
             } catch (thumbnailErr) {
               if (!thumbnailWarning) {
-                thumbnailWarning = thumbnailErr && thumbnailErr.message ? thumbnailErr.message : "Could not set custom thumbnail on one or more videos.";
+                var is403 = thumbnailErr && thumbnailErr.status === 403;
+                thumbnailWarning = is403
+                  ? "Custom thumbnail was not set (permission or policy). You can set it in YouTube Studio."
+                  : (thumbnailErr && thumbnailErr.message ? thumbnailErr.message : "Could not set custom thumbnail on one or more videos.");
               }
             }
           }
