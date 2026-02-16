@@ -287,6 +287,7 @@
       aspect-ratio: 3 / 4;
       box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
       transition: transform 0.25s ease, box-shadow 0.25s ease;
+      cursor: pointer;
     }
 
     .media-card:hover {
@@ -824,20 +825,50 @@
     }
     .getbirds-tv-panel:focus { outline: 2px solid rgba(255,255,255,0.4); outline-offset: -2px; }
     .getbirds-tv-video-wrap {
-      flex: 0 0 auto;
+      position: relative;
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 0;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-width: 0;
-      max-height: 100%;
+      width: 100%;
     }
-    .getbirds-tv-video {
+    .getbirds-tv-video,
+    .getbirds-tv-image {
       max-width: 100%;
       max-height: 100%;
       width: auto;
       height: auto;
       object-fit: contain;
+      display: block;
     }
+    .getbirds-tv-video.hidden { display: none !important; }
+    .getbirds-tv-image {
+      position: absolute;
+      inset: 0;
+      margin: auto;
+    }
+    .getbirds-tv-image.hidden { display: none !important; }
+    .getbirds-tv-download {
+      position: absolute;
+      bottom: 1rem;
+      right: 1rem;
+      z-index: 10;
+      width: 2.25rem;
+      height: 2.25rem;
+      padding: 0;
+      font-size: 1rem;
+      line-height: 1;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      cursor: pointer;
+      pointer-events: auto;
+      text-decoration: none;
+    }
+    .getbirds-tv-download:hover { background: rgba(0,0,0,0.75); color: #fff; }
     .getbirds-tv-overlays {
       position: absolute;
       inset: 0;
@@ -1000,6 +1031,7 @@
       <div id="getbirdsTvPrevPanel" class="getbirds-tv-panel getbirds-tv-prev" aria-label="Play previous" role="button" tabindex="0"></div>
       <div class="getbirds-tv-video-wrap">
         <video id="getbirdsTvVideo" class="getbirds-tv-video" autoplay playsinline></video>
+        <img id="getbirdsTvImage" class="getbirds-tv-image hidden" alt="" />
       </div>
       <div id="getbirdsTvNextPanel" class="getbirds-tv-panel getbirds-tv-next" aria-label="Play next" role="button" tabindex="0"></div>
     </div>
@@ -1009,6 +1041,7 @@
       <div id="getbirdsTvLowerThird" class="getbirds-tv-lower-third" aria-hidden="true"></div>
       <div id="getbirdsTvSnipe" class="getbirds-tv-snipe" aria-hidden="true"></div>
     </div>
+    <button type="button" id="getbirdsTvDownload" class="getbirds-tv-download" aria-label="Download" title="Download" style="display: none;">↓</button>
     <button type="button" id="getbirdsTvUnmute" class="getbirds-tv-unmute" aria-label="Unmute">🔊</button>
     <button type="button" id="getbirdsTvClose" class="getbirds-tv-close" aria-label="Close GetBirds.TV">×</button>
   </div>
@@ -1139,10 +1172,12 @@
   const getbirdsTvBtn = $("getbirdsTvBtn");
   const getbirdsTvOverlay = $("getbirdsTvOverlay");
   const getbirdsTvVideo = $("getbirdsTvVideo");
+  const getbirdsTvImage = $("getbirdsTvImage");
   const getbirdsTvPrevPanel = $("getbirdsTvPrevPanel");
   const getbirdsTvNextPanel = $("getbirdsTvNextPanel");
   const getbirdsTvClose = $("getbirdsTvClose");
   const getbirdsTvUnmute = $("getbirdsTvUnmute");
+  const getbirdsTvDownload = $("getbirdsTvDownload");
   const getbirdsTvLowerThird = $("getbirdsTvLowerThird");
   const getbirdsTvSnipe = $("getbirdsTvSnipe");
 
@@ -2136,8 +2171,6 @@
   function collectPostcardInBirdBuddy(postcard) {
     var feedItemId = postcard && postcard.id ? String(postcard.id) : "";
     if (!feedItemId) return Promise.reject(new Error("Postcard ID missing"));
-    var bbToken = localStorage.getItem(STORAGE_KEYS.bbAccessToken);
-    if (!bbToken) return Promise.reject(new Error("Not signed in to GetBirds"));
 
     var shareToCommunity = postcardHasKnownSpecies(postcard);
     var attempts = [
@@ -2167,7 +2200,7 @@
       }
     ];
 
-    function executeAttempt(index, lastMsg) {
+    function executeAttempt(index, lastMsg, bbToken) {
       if (index >= attempts.length) {
         return Promise.reject(new Error(lastMsg || "Save to collection failed"));
       }
@@ -2176,6 +2209,7 @@
         return r.json().catch(function () { return {}; }).then(function (data) {
           var collected = extractCollectedPostcardFromCollectResponse(data);
           var errMsg = "";
+          var errCode = (data && data.errors && data.errors[0] && data.errors[0].extensions && data.errors[0].extensions.code) || "";
           if (data && data.errors && data.errors.length) errMsg = data.errors[0].message || "";
           if (!errMsg && !r.ok) errMsg = getGraphqlErrorMessage(data, r);
           if (collected) {
@@ -2203,7 +2237,18 @@
               fallbackErr.tryNextMutation = true;
               throw fallbackErr;
             }
-            throw new Error(normalizeCollectionErrorMessage(errMsg));
+            var authErr = new Error(normalizeCollectionErrorMessage(errMsg));
+            if (isBirdBuddyAuthError(errCode, errMsg)) {
+              authErr.isAuthError = true;
+              authErr.tokenExpiredContext = {
+                operation: "postcardCollect",
+                feedItemId: feedItemId,
+                attemptIndex: index,
+                attemptOperationName: attempt.request.operationName,
+                timestamp: new Date().toISOString()
+              };
+            }
+            throw authErr;
           }
           var savedMediaCount = collected && Array.isArray(collected.medias)
             ? collected.medias.length
@@ -2216,16 +2261,39 @@
           };
         });
       }).catch(function (e) {
+        if (e && e.isAuthError) {
+          return Promise.reject(e);
+        }
         var msg = normalizeCollectionErrorMessage(e && e.message ? e.message : "Save to collection failed");
         if (attempt.allowFallback && index < attempts.length - 1 &&
             ((e && e.tryNextMutation) || shouldFallbackCollectMutation(msg))) {
-          return executeAttempt(index + 1, msg);
+          return executeAttempt(index + 1, msg, bbToken);
         }
         return Promise.reject(new Error(msg));
       });
     }
 
-    return executeAttempt(0, "");
+    function runCollect() {
+      return getValidBbToken().then(function (bbToken) {
+        return executeAttempt(0, "", bbToken);
+      });
+    }
+
+    return runCollect().catch(function (e) {
+      if (e && e.isAuthError) {
+        var tokenExpiredContext = e.tokenExpiredContext || {
+          operation: "postcardCollect",
+          feedItemId: feedItemId,
+          timestamp: new Date().toISOString()
+        };
+        if (typeof e.tokenExpiredContext === "undefined") e.tokenExpiredContext = tokenExpiredContext;
+        clearBirdBuddyTokens();
+        return getValidBbToken().then(function (newToken) {
+          return executeAttempt(0, "", newToken);
+        });
+      }
+      return Promise.reject(e);
+    });
   }
 
   function authBirdBuddy(googleToken) {
@@ -2246,6 +2314,33 @@
         if (auth.refreshToken) localStorage.setItem(STORAGE_KEYS.bbRefreshToken, auth.refreshToken);
         return auth.accessToken;
       });
+  }
+
+  function isBbTokenFresh() {
+    var token = localStorage.getItem(STORAGE_KEYS.bbAccessToken);
+    var exp = parseInt(localStorage.getItem(STORAGE_KEYS.bbExpiresAt) || "0", 10);
+    if (!exp && token) {
+      exp = getTokenExpiryMsFromJwt(token);
+      if (exp) localStorage.setItem(STORAGE_KEYS.bbExpiresAt, String(exp));
+    }
+    return !!(token && exp && Date.now() < exp - BB_TOKEN_STALE_MS);
+  }
+
+  function clearBirdBuddyTokens() {
+    localStorage.removeItem(STORAGE_KEYS.bbAccessToken);
+    localStorage.removeItem(STORAGE_KEYS.bbExpiresAt);
+    localStorage.removeItem(STORAGE_KEYS.bbRefreshToken);
+  }
+
+  /** Returns a valid BB access token: uses stored token if still fresh, otherwise re-auths with Google token. Rejects if not signed in. */
+  function getValidBbToken() {
+    if (isBbTokenFresh()) {
+      var token = localStorage.getItem(STORAGE_KEYS.bbAccessToken);
+      if (token) return Promise.resolve(token);
+    }
+    var googleToken = localStorage.getItem(STORAGE_KEYS.googleAccessToken);
+    if (!googleToken) return Promise.reject(new Error("Not signed in to GetBirds"));
+    return authBirdBuddy(googleToken);
   }
 
   var ME_QUERY = [
@@ -2775,9 +2870,28 @@
       wrap.appendChild(label);
       var grid = document.createElement("div");
       grid.className = "postcard-group-media";
-      postcard.medias.forEach(function (m) {
+      postcard.medias.forEach(function (m, mediaIndex) {
         var card = document.createElement("div");
         card.className = "media-card";
+        card.setAttribute("data-postcard-tv", "1");
+        card.setAttribute("role", "button");
+        card.setAttribute("tabindex", "0");
+        card.setAttribute("aria-label", "Play in TV view");
+        card.addEventListener("click", function (ev) {
+          if (ev.target.closest(".media-link")) return;
+          ev.preventDefault();
+          var segments = getPostcardSegments(postcard);
+          if (segments.length === 0) return;
+          openGetBirdsTVWithSegments(segments, mediaIndex);
+        });
+        card.addEventListener("keydown", function (ev) {
+          if (ev.target.closest(".media-link")) return;
+          if (ev.key !== "Enter" && ev.key !== " ") return;
+          ev.preventDefault();
+          var segments = getPostcardSegments(postcard);
+          if (segments.length === 0) return;
+          openGetBirdsTVWithSegments(segments, mediaIndex);
+        });
         if (m.isVideo) {
           var v = document.createElement("video");
           v.src = m.url;
@@ -2914,12 +3028,6 @@
 
   function fetchBirdBuddyFeed() {
     var googleToken = localStorage.getItem(STORAGE_KEYS.googleAccessToken);
-    var bbToken = localStorage.getItem(STORAGE_KEYS.bbAccessToken);
-    var bbExp = parseInt(localStorage.getItem(STORAGE_KEYS.bbExpiresAt) || "0", 10);
-    if (!bbExp && bbToken) {
-      bbExp = getTokenExpiryMsFromJwt(bbToken);
-      if (bbExp) localStorage.setItem(STORAGE_KEYS.bbExpiresAt, String(bbExp));
-    }
 
     function applyFeedResponse(data) {
       var postcards = collectPostcardsFromFeed(data);
@@ -2949,41 +3057,29 @@
       });
     }
 
-    function runFeedFetch(useStoredToken) {
-      if (useStoredToken && bbToken && bbExp && Date.now() < bbExp - BB_TOKEN_STALE_MS) {
-        return doFetch(bbToken);
-      }
-      return authBirdBuddy(googleToken).then(function (accessToken) {
-        return doFetch(accessToken);
-      });
-    }
-
-    function isBbTokenFresh() {
-      var token = localStorage.getItem(STORAGE_KEYS.bbAccessToken);
-      var exp = parseInt(localStorage.getItem(STORAGE_KEYS.bbExpiresAt) || "0", 10);
-      if (!exp && token) {
-        exp = getTokenExpiryMsFromJwt(token);
-        if (exp) localStorage.setItem(STORAGE_KEYS.bbExpiresAt, String(exp));
-      }
-      return !!(token && exp && Date.now() < exp - BB_TOKEN_STALE_MS);
-    }
-
-    function clearBirdBuddyTokens() {
-      localStorage.removeItem(STORAGE_KEYS.bbAccessToken);
-      localStorage.removeItem(STORAGE_KEYS.bbExpiresAt);
-      localStorage.removeItem(STORAGE_KEYS.bbRefreshToken);
-    }
-
     var isInitialLoad = loadMoreCursor === null;
     if (isInitialLoad) setBusy(true);
     loadMoreBtn.disabled = true;
 
-    var p = runFeedFetch(isBbTokenFresh());
+    function runWithRetryOnTokenExpired() {
+      return getValidBbToken().then(function (token) {
+        return doFetch(token);
+      });
+    }
+
+    var p = runWithRetryOnTokenExpired();
 
     return p.catch(function (e) {
       if (e && e.isAuthError && googleToken) {
+        var tokenExpiredContext = {
+          operation: "fetchBirdBuddyFeed",
+          timestamp: new Date().toISOString(),
+          loadMoreCursor: loadMoreCursor,
+          hasMore: hasMore
+        };
+        if (typeof e.tokenExpiredContext === "undefined") e.tokenExpiredContext = tokenExpiredContext;
         clearBirdBuddyTokens();
-        return runFeedFetch(false);
+        return runWithRetryOnTokenExpired();
       }
       return Promise.reject(e);
     }).then(function () {
@@ -4372,7 +4468,30 @@
     return null;
   }
 
-  /** Collect visible MP4s from the grid (honors species/camera filter). Returns { url, postcardId, species, createdAt, firstImageUrl }. */
+  /** Build segments for a single postcard (all media: images + videos). Each segment: { url, isVideo, species, createdAt, firstImageUrl, downloadName, postcardId }. */
+  function getPostcardSegments(postcard) {
+    if (!postcard || !postcard.medias || postcard.medias.length === 0) return [];
+    var species = formatSpeciesLabel(postcard);
+    var createdAt = postcard.createdAt ? formatPostcardDate(postcard.createdAt) : "—";
+    var postcardId = postcard.id || "";
+    var firstImageUrl = getFirstPostcardImageUrl(postcard);
+    var segments = [];
+    postcard.medias.forEach(function (m) {
+      var panelImageUrl = m.isVideo ? (m.thumb || firstImageUrl) : m.url;
+      segments.push({
+        url: m.url,
+        isVideo: !!m.isVideo,
+        species: species,
+        createdAt: createdAt,
+        firstImageUrl: panelImageUrl || firstImageUrl,
+        downloadName: filenameFromMedia(m),
+        postcardId: postcardId
+      });
+    });
+    return segments;
+  }
+
+  /** Collect visible MP4s from the grid (honors species/camera filter). Returns same segment shape as getPostcardSegments (video-only). */
   function getVisibleVideoSegments() {
     if (!mediaGrid) return [];
     var segments = [];
@@ -4390,7 +4509,15 @@
         if (!/\.(mp4|webm|mov)$/.test(name)) continue;
         var url = a.getAttribute("data-media-url") || a.href || "";
         if (!url) continue;
-        segments.push({ url: url, postcardId: postcardId, species: species, createdAt: createdAt, firstImageUrl: firstImageUrl });
+        segments.push({
+          url: url,
+          isVideo: true,
+          postcardId: postcardId,
+          species: species,
+          createdAt: createdAt,
+          firstImageUrl: firstImageUrl,
+          downloadName: a.getAttribute("data-download-name") || a.getAttribute("download") || ""
+        });
       }
     });
     return segments;
@@ -4402,14 +4529,39 @@
   var getbirdsTvEscapeHandler = null;
 
   function playGetBirdsTvSegmentAtIndex(index) {
-    if (getbirdsTvSegments.length === 0 || !getbirdsTvVideo) return;
+    if (getbirdsTvSegments.length === 0) return;
     var n = getbirdsTvSegments.length;
     getbirdsTvIndex = ((index % n) + n) % n;
     var segment = getbirdsTvSegments[getbirdsTvIndex];
-    getbirdsTvVideo.src = segment.url;
-    getbirdsTvVideo.load();
+    var isVideo = segment.isVideo !== false;
+    if (getbirdsTvVideo) {
+      if (isVideo) {
+        getbirdsTvVideo.src = segment.url;
+        getbirdsTvVideo.load();
+        getbirdsTvVideo.classList.remove("hidden");
+        getbirdsTvVideo.muted = false;
+        getbirdsTvVideo.play().catch(function () {});
+      } else {
+        getbirdsTvVideo.pause();
+        getbirdsTvVideo.removeAttribute("src");
+        getbirdsTvVideo.load();
+        getbirdsTvVideo.classList.add("hidden");
+      }
+    }
+    if (getbirdsTvImage) {
+      if (!isVideo) {
+        getbirdsTvImage.src = segment.url;
+        getbirdsTvImage.alt = segment.species || "Postcard";
+        getbirdsTvImage.classList.remove("hidden");
+      } else {
+        getbirdsTvImage.removeAttribute("src");
+        getbirdsTvImage.classList.add("hidden");
+      }
+    }
     updateGetBirdsTvOverlays(segment);
-    getbirdsTvVideo.play().catch(function () {});
+    updateGetBirdsTvDownloadButton(segment);
+    updateGetBirdsTvUnmuteButton();
+    if (getbirdsTvUnmute) getbirdsTvUnmute.style.display = isVideo ? "" : "none";
   }
 
   function updateGetBirdsTvOverlays(segment) {
@@ -4453,15 +4605,11 @@
     playGetBirdsTvSegmentAtIndex(getbirdsTvIndex);
   }
 
-  function openGetBirdsTV() {
-    getbirdsTvSegments = getVisibleVideoSegments();
-    if (getbirdsTvSegments.length === 0) {
-      setHeaderStatus("No visible MP4s. Add postcards or change the filter.", true);
-      return;
-    }
-    if (!getbirdsTvOverlay || !getbirdsTvVideo) return;
-    getbirdsTvIndex = 0;
-    getbirdsTvVideo.muted = false;
+  function openGetBirdsTVWithSegments(segments, startIndex) {
+    if (!segments || segments.length === 0) return;
+    if (!getbirdsTvOverlay) return;
+    getbirdsTvSegments = segments;
+    getbirdsTvIndex = typeof startIndex === "number" ? startIndex : 0;
     getbirdsTvOverlay.classList.remove("hidden");
     if (!getbirdsTvEscapeHandler) {
       getbirdsTvEscapeHandler = function (e) {
@@ -4471,12 +4619,17 @@
       };
       document.addEventListener("keydown", getbirdsTvEscapeHandler);
     }
-    updateGetBirdsTvUnmuteButton();
-    getbirdsTvVideo.onended = function () {
-      if (getbirdsTvSegments.length === 0) return;
-      getbirdsTvIndex = (getbirdsTvIndex + 1) % getbirdsTvSegments.length;
-      playNextGetBirdsTvSegment();
-    };
+    if (getbirdsTvVideo) {
+      getbirdsTvVideo.muted = false;
+      getbirdsTvVideo.onended = function () {
+        if (getbirdsTvSegments.length === 0) return;
+        var seg = getbirdsTvSegments[getbirdsTvIndex];
+        if (seg && seg.isVideo !== false) {
+          getbirdsTvIndex = (getbirdsTvIndex + 1) % getbirdsTvSegments.length;
+          playNextGetBirdsTvSegment();
+        }
+      };
+    }
     playNextGetBirdsTvSegment();
     if (getbirdsTvSegments.length >= 2 && !getbirdsTvKeyHandler) {
       getbirdsTvKeyHandler = function (e) {
@@ -4494,12 +4647,34 @@
     }
   }
 
+  function openGetBirdsTV() {
+    var segments = getVisibleVideoSegments();
+    if (segments.length === 0) {
+      setHeaderStatus("No visible MP4s. Add postcards or change the filter.", true);
+      return;
+    }
+    openGetBirdsTVWithSegments(segments, 0);
+  }
+
   function updateGetBirdsTvUnmuteButton() {
     if (!getbirdsTvUnmute || !getbirdsTvVideo) return;
     var muted = getbirdsTvVideo.muted;
     getbirdsTvUnmute.textContent = muted ? "🔇" : "🔊";
     getbirdsTvUnmute.classList.toggle("muted", muted);
     getbirdsTvUnmute.setAttribute("aria-label", muted ? "Unmute" : "Mute");
+  }
+
+  function updateGetBirdsTvDownloadButton(segment) {
+    if (!getbirdsTvDownload) return;
+    if (!segment || !segment.url) {
+      getbirdsTvDownload.style.display = "none";
+      getbirdsTvDownload.removeAttribute("data-download-url");
+      getbirdsTvDownload.removeAttribute("data-download-name");
+      return;
+    }
+    getbirdsTvDownload.style.display = "";
+    getbirdsTvDownload.setAttribute("data-download-url", segment.url);
+    getbirdsTvDownload.setAttribute("data-download-name", segment.downloadName || "");
   }
 
   function closeGetBirdsTV() {
@@ -4517,7 +4692,18 @@
       getbirdsTvVideo.removeAttribute("src");
       getbirdsTvVideo.load();
       getbirdsTvVideo.onended = null;
+      getbirdsTvVideo.classList.remove("hidden");
     }
+    if (getbirdsTvImage) {
+      getbirdsTvImage.removeAttribute("src");
+      getbirdsTvImage.classList.add("hidden");
+    }
+    if (getbirdsTvDownload) {
+      getbirdsTvDownload.style.display = "none";
+      getbirdsTvDownload.removeAttribute("data-download-url");
+      getbirdsTvDownload.removeAttribute("data-download-name");
+    }
+    if (getbirdsTvUnmute) getbirdsTvUnmute.style.display = "";
     getbirdsTvSegments = [];
   }
 
@@ -4667,6 +4853,17 @@
     getbirdsTvUnmute.addEventListener("click", function () {
       getbirdsTvVideo.muted = !getbirdsTvVideo.muted;
       updateGetBirdsTvUnmuteButton();
+    });
+  }
+  if (getbirdsTvDownload) {
+    getbirdsTvDownload.addEventListener("click", function () {
+      var url = getbirdsTvDownload.getAttribute("data-download-url");
+      var name = getbirdsTvDownload.getAttribute("data-download-name") || "";
+      if (!url) return;
+      if (!name && url) name = "file_" + md5HashString(url) + detectDownloadExtension(url, /\.mp4|\.mov|\.webm/i.test(url));
+      downloadMediaAsFile(url, name).catch(function (err) {
+        setHeaderStatus((err && err.message) || "Download failed.", true);
+      });
     });
   }
   if (youtubeUploadModalOverlay) {
