@@ -211,16 +211,16 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     *, *::before, *::after { box-sizing: border-box; }
 
     :root {
-      --bg: #f5f2eb;
-      --surface: #fff;
-      --surface-alt: #ebe7df;
-      --border: #d4cfc4;
-      --text: #1a1a1a;
-      --text-soft: #4a4a4a;
-      --muted: #6b6560;
-      --accent: #2d5a4a;
-      --accent-hover: #234a3d;
-      --accent-light: #e8f0ee;
+      --bg: #f5f1f8;
+      --surface: #ffffff;
+      --surface-alt: #ece5f1;
+      --border: #d3c7da;
+      --text: #211b26;
+      --text-soft: #51445a;
+      --muted: #76697c;
+      --accent: #6f3c8f;
+      --accent-hover: #572d73;
+      --accent-light: #eadff0;
       --error: #c23d3d;
       --radius: 12px;
       --radius-sm: 8px;
@@ -2048,7 +2048,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
   function getAvatarFallbackDataUri(initials) {
     var letter = (initials || "?").slice(0, 2).toUpperCase();
-    var svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"44\" height=\"44\" viewBox=\"0 0 44 44\"><circle cx=\"22\" cy=\"22\" r=\"22\" fill=\"#d4cfc4\"/><text x=\"22\" y=\"28\" font-family=\"system-ui,sans-serif\" font-size=\"18\" font-weight=\"600\" fill=\"#6b6560\" text-anchor=\"middle\">" + letter + "</text></svg>";
+    var svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"44\" height=\"44\" viewBox=\"0 0 44 44\"><circle cx=\"22\" cy=\"22\" r=\"22\" fill=\"#d3c7da\"/><text x=\"22\" y=\"28\" font-family=\"system-ui,sans-serif\" font-size=\"18\" font-weight=\"600\" fill=\"#76697c\" text-anchor=\"middle\">" + letter + "</text></svg>";
     return "data:image/svg+xml," + encodeURIComponent(svg);
   }
 
