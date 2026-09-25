@@ -193,6 +193,152 @@ function gbirds_proxy_media(): void {
     exit;
 }
 
+/**
+ * Allow-list of hosts the HLS live proxy may fetch from. BirdBuddy livestreams
+ * are delivered from AWS (CloudFront / MediaPackage / IVS) and mybirdbuddy.com.
+ * Suffix-locked to prevent this from becoming an open proxy (SSRF guard).
+ */
+function gbirds_allowed_hls_host(string $host): bool {
+    $host = strtolower(trim($host));
+    if ($host === '') return false;
+    // Never allow raw IPs (blocks SSRF to internal ranges via IP literals).
+    if (filter_var($host, FILTER_VALIDATE_IP)) return false;
+    $suffixes = [
+        '.mybirdbuddy.com',
+        '.amazonaws.com',
+        '.cloudfront.net',
+        '.live-video.net',   // AWS IVS
+        '.media-amazon.com',
+    ];
+    foreach ($suffixes as $s) {
+        if (str_ends_with($host, $s)) return true;
+    }
+    return false;
+}
+
+function gbirds_resolve_url(string $base, string $rel): string {
+    $rel = trim($rel);
+    if ($rel === '') return $base;
+    if (preg_match('#^https?://#i', $rel)) return $rel;
+    $p = parse_url($base);
+    if (!$p || empty($p['scheme']) || empty($p['host'])) return $rel;
+    $scheme = $p['scheme'];
+    $host = $p['host'];
+    $port = isset($p['port']) ? (':' . $p['port']) : '';
+    if (str_starts_with($rel, '//')) return $scheme . ':' . $rel;
+    if (str_starts_with($rel, '/')) return $scheme . '://' . $host . $port . $rel;
+    $path = $p['path'] ?? '/';
+    $dir = substr($path, 0, strrpos($path, '/') + 1);
+    if ($dir === '') $dir = '/';
+    // Collapse ../ and ./ segments.
+    $combined = $dir . $rel;
+    $segments = [];
+    foreach (explode('/', $combined) as $seg) {
+        if ($seg === '.' || $seg === '') { if ($seg === '' && count($segments) === 0) { $segments[] = ''; } continue; }
+        if ($seg === '..') { if (count($segments) > 1) array_pop($segments); continue; }
+        $segments[] = $seg;
+    }
+    $newPath = '/' . ltrim(implode('/', $segments), '/');
+    return $scheme . '://' . $host . $port . $newPath;
+}
+
+function gbirds_hls_self_base(): string {
+    $https = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
+        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    $scheme = $https ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'hh5hh.com';
+    $script = $_SERVER['SCRIPT_NAME'] ?? '/gbirds.php';
+    return $scheme . '://' . $host . $script;
+}
+
+function gbirds_hls_rewrite_manifest(string $body, string $manifestUrl, string $self): string {
+    $lines = preg_split('/\r\n|\r|\n/', $body);
+    $out = [];
+    foreach ($lines as $line) {
+        $t = trim($line);
+        if ($t === '') { $out[] = $line; continue; }
+        if ($t[0] === '#') {
+            // Rewrite URI="..." attributes (EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, etc.)
+            $line = preg_replace_callback('/URI="([^"]*)"/', function ($m) use ($manifestUrl, $self) {
+                if ($m[1] === '') return $m[0];
+                $abs = gbirds_resolve_url($manifestUrl, $m[1]);
+                return 'URI="' . $self . '?api=hls-proxy&url=' . rawurlencode($abs) . '"';
+            }, $line);
+            $out[] = $line;
+        } else {
+            $abs = gbirds_resolve_url($manifestUrl, $t);
+            $out[] = $self . '?api=hls-proxy&url=' . rawurlencode($abs);
+        }
+    }
+    return implode("\n", $out);
+}
+
+/**
+ * Same-origin HLS proxy for the BirdBuddy livestream. Fixes the CORS wall (the
+ * browser talks only to our origin; we fetch BirdBuddy server-to-server) by
+ * rewriting playlist URIs back through this endpoint and streaming segments.
+ * NOTE: this cannot fix the HEVC/H.265 codec — desktop Chrome still can't decode
+ * BirdBuddy's stream. Safari (native HLS + hardware HEVC) plays it directly.
+ */
+function gbirds_hls_proxy(): void {
+    gbirds_cors_headers();
+    header('Access-Control-Allow-Origin: *');
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') { http_response_code(204); exit; }
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        gbirds_json_response(['error' => 'Method not allowed.'], 405);
+    }
+    gbirds_require_curl();
+    $url = trim((string)($_GET['url'] ?? ''));
+    $parts = $url !== '' ? parse_url($url) : false;
+    if (!$parts || strtolower((string)($parts['scheme'] ?? '')) !== 'https' || empty($parts['host']) || !gbirds_allowed_hls_host((string)$parts['host'])) {
+        gbirds_json_response(['error' => 'Invalid or disallowed live stream URL.'], 400);
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => ['Accept: */*', 'User-Agent: GetBirds/1.0'],
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        $err = curl_error($ch); curl_close($ch);
+        gbirds_json_response(['error' => 'Live stream proxy request failed.', 'detail' => $err], 502);
+    }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $responseHeaders = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    $contentType = 'application/octet-stream';
+    if (preg_match('/^Content-Type:\s*([^\r\n]+)/im', $responseHeaders, $m)) {
+        $contentType = trim($m[1]);
+    }
+    curl_close($ch);
+
+    $path = strtolower((string)($parts['path'] ?? ''));
+    $isManifest = stripos($contentType, 'mpegurl') !== false
+        || stripos($contentType, 'vnd.apple') !== false
+        || str_ends_with($path, '.m3u8')
+        || str_starts_with(ltrim($body), '#EXTM3U');
+
+    http_response_code($status ?: 502);
+    if ($isManifest) {
+        $rewritten = gbirds_hls_rewrite_manifest($body, $url, gbirds_hls_self_base());
+        header('Content-Type: application/vnd.apple.mpegurl');
+        header('Cache-Control: no-store');
+        echo $rewritten;
+    } else {
+        header('Content-Type: ' . $contentType);
+        header('Cache-Control: private, max-age=30');
+        header('Content-Length: ' . strlen($body));
+        echo $body;
+    }
+    exit;
+}
+
 
 
 function gbirds_config_value(string $name, string $default = ''): string {
@@ -234,7 +380,7 @@ function gbirds_frameio_config(): array {
 // Bump this whenever gbirds.php is redeployed so ?api=frameio-status confirms the
 // LIVE server is running the intended build (guards against stale uploads).
 if (!defined('FIREBIRD_BUILD_VERSION')) {
-    define('FIREBIRD_BUILD_VERSION', 'firebird-2026-09-24-onelogin-dedupe-5');
+    define('FIREBIRD_BUILD_VERSION', 'firebird-2026-09-25-status-slug-dbg-14');
 }
 
 function gbirds_session_start(): void {
@@ -334,6 +480,8 @@ function gbirds_frameio_begin_auth(): void {
     $createdAt = trim((string)($input['createdAt'] ?? ''));
     $species = trim((string)($input['species'] ?? ''));
     $postcardId = trim((string)($input['postcardId'] ?? ''));
+    $description = gbirds_frameio_clean_description($input['description'] ?? '');
+    $metadata = gbirds_frameio_sanitize_metadata_map($input['metadata'] ?? []);
     if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
         gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
     }
@@ -351,7 +499,9 @@ function gbirds_frameio_begin_auth(): void {
         'filename'=>$filename,
         'createdAt'=>$createdAt,
         'species'=>$species,
-        'postcardId'=>$postcardId
+        'postcardId'=>$postcardId,
+        'description'=>$description,
+        'metadata'=>$metadata
     ];
 
     try {
@@ -495,7 +645,7 @@ function gbirds_frameio_access_token(): string {
 
 function gbirds_frameio_clear_session(): void {
     gbirds_session_start();
-    unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_oauth_state'], $_SESSION['frameio_pending_upload'], $_SESSION['frameio_usage_authenticated'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_auth_error'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_date_collections']);
+    unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_oauth_state'], $_SESSION['frameio_pending_upload'], $_SESSION['frameio_usage_authenticated'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_auth_error'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_date_collections'], $_SESSION['frameio_metadata_field_defs']);
 }
 
 
@@ -641,6 +791,285 @@ function gbirds_sanitize_frameio_filename(string $name): string {
     return substr($name ?: 'bird-media', 0, 180);
 }
 
+/** Normalize a harvested metadata description for use as a Frame.io comment. */
+function gbirds_frameio_clean_description($value): string {
+    if (is_array($value)) {
+        // Accept a {label:value} map too — render as lines.
+        $lines = [];
+        foreach ($value as $k => $v) {
+            if (is_scalar($v)) $lines[] = trim((string)$k) . ': ' . trim((string)$v);
+        }
+        $value = implode("\n", $lines);
+    }
+    $text = trim((string)$value);
+    if ($text === '') return '';
+    // Strip control chars except newline/tab; cap length (Frame.io comment limit).
+    $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $text);
+    if (strlen($text) > 4000) $text = substr($text, 0, 3997) . '…';
+    return $text;
+}
+
+/** Cap and sanitize the client-harvested {label:value} BirdBuddy metadata map
+ * before it touches the session or any Frame.io API call. */
+function gbirds_frameio_sanitize_metadata_map($raw): array {
+    if (!is_array($raw)) return [];
+    $out = [];
+    $count = 0;
+    foreach ($raw as $k => $v) {
+        if ($count >= 40) break;
+        $key = trim((string)$k);
+        if ($key === '' || !is_scalar($v)) continue;
+        $val = trim((string)$v);
+        if ($val === '') continue;
+        $out[substr($key, 0, 80)] = substr($val, 0, 500);
+        $count++;
+    }
+    return $out;
+}
+
+/**
+ * Attach the harvested BirdBuddy metadata to the uploaded asset as a comment —
+ * Frame.io V4 files have no writable description field, so a comment is the
+ * canonical place for rich notes. Best-effort: never fails the upload.
+ */
+function gbirds_frameio_add_comment(string $accessToken, string $accountId, string $fileId, string $text): bool {
+    $text = gbirds_frameio_clean_description($text);
+    if ($text === '' || $fileId === '' || $accountId === '') return false;
+    $cfg = gbirds_frameio_config();
+    try {
+        [$status, $data] = gbirds_frameio_http(
+            'POST',
+            $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/files/' . rawurlencode($fileId) . '/comments',
+            ['data' => ['text' => $text]],
+            $accessToken
+        );
+        if ($status < 200 || $status >= 300) {
+            error_log('GetBirds Frame.io add-comment failed (' . $status . '): ' . substr(json_encode($data), 0, 300));
+            return false;
+        }
+        return true;
+    } catch (Throwable $e) {
+        error_log('GetBirds Frame.io add-comment exception: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Resolve ALL of the account's custom metadata field definitions once per
+ * account, keyed by lowercased field name → ['field_id','field_type','options'
+ * (lowercased option label → id/value), 'mutable']. Every per-asset field
+ * (Status, Keywords, Notes, Model, Uploader, Source Filename, ...) is set
+ * through the same /metadata/values endpoint, so everything shares one lookup
+ * and one session cache per account.
+ */
+function gbirds_frameio_resolve_metadata_field_defs(string $accessToken, string $accountId): array {
+    gbirds_session_start();
+    $cached = $_SESSION['frameio_metadata_field_defs'][$accountId] ?? null;
+    if (is_array($cached) && !empty($cached)) return $cached;
+
+    $cfg = gbirds_frameio_config();
+    $result = [];
+    try {
+        [$status, $data] = gbirds_frameio_http(
+            'GET',
+            $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/metadata/field_definitions',
+            null,
+            $accessToken,
+            ['api-version: experimental']
+        );
+        if ($status >= 200 && $status < 300 && is_array($data)) {
+            $fields = $data['data'] ?? [];
+            foreach ((is_array($fields) ? $fields : []) as $f) {
+                if (!is_array($f)) continue;
+                $fid = trim((string)($f['id'] ?? $f['field_definition_id'] ?? ''));
+                $fname = strtolower(trim((string)($f['name'] ?? $f['field_name'] ?? $f['title'] ?? '')));
+                if ($fid === '' || $fname === '') continue;
+                $ftype = strtolower(trim((string)($f['field_type'] ?? $f['type'] ?? 'text')));
+                // The real shape (confirmed via a live field_definitions dump) nests
+                // options under field_configuration; a few other shapes are kept as
+                // fallbacks in case the API varies by field type.
+                $opts = $f['field_configuration']['options'] ?? $f['options'] ?? $f['field_options'] ?? $f['values'] ?? [];
+                if (!is_array($opts)) $opts = [];
+                $optMap = [];
+                foreach ($opts as $o) {
+                    if (!is_array($o)) continue;
+                    $olabel = trim((string)($o['display_name'] ?? $o['name'] ?? $o['label'] ?? $o['value'] ?? $o['title'] ?? ''));
+                    if ($olabel === '') continue;
+                    $optMap[strtolower($olabel)] = ($o['id'] ?? $o['value'] ?? $olabel);
+                }
+                $mutable = array_key_exists('mutable', $f) ? (bool)$f['mutable'] : true;
+                $result[$fname] = ['field_id' => $fid, 'field_type' => $ftype, 'options' => $optMap, 'mutable' => $mutable];
+            }
+        } else {
+            error_log('GetBirds Frame.io field-definitions lookup failed (' . $status . '): ' . substr(json_encode($data), 0, 300));
+        }
+    } catch (Throwable $e) {
+        error_log('GetBirds Frame.io field-definitions exception: ' . $e->getMessage());
+    }
+    // Only cache a SUCCESSFUL resolution; otherwise retry on the next upload.
+    if (!empty($result)) {
+        $_SESSION['frameio_metadata_field_defs'][$accountId] = $result;
+    }
+    return $result;
+}
+
+/**
+ * Resolve the account's "Status" metadata field: its field_definition_id and a
+ * map of option-label (lowercased) → option value/id. In Frame.io V4 the asset
+ * Status (Needs Review / In Progress / Approved) is a metadata field, not a
+ * built-in property, so we must look it up by listing field definitions.
+ * Returns ['field_id'=>'', 'options'=>[]].
+ */
+function gbirds_frameio_resolve_status_field(string $accessToken, string $accountId): array {
+    $defs = gbirds_frameio_resolve_metadata_field_defs($accessToken, $accountId);
+    if (isset($defs['status'])) {
+        return ['field_id' => $defs['status']['field_id'], 'options' => $defs['status']['options']];
+    }
+    // Fall back to matching by option labels in case the field isn't literally named "Status".
+    $wanted = ['needs review', 'in progress', 'approved'];
+    foreach ($defs as $def) {
+        if (count(array_intersect($wanted, array_keys($def['options'] ?? []))) >= 2) {
+            return ['field_id' => $def['field_id'], 'options' => $def['options']];
+        }
+    }
+    return ['field_id' => '', 'options' => []];
+}
+
+/**
+ * Best-effort: fill every OTHER custom metadata field that can be reasonably
+ * derived from the harvested BirdBuddy data (Keywords, Notes, Uploader, Model,
+ * Source Filename). Keywords falls back to the full comment text when no
+ * species/feeder tags were harvested. Frame.io's own technical fields — File
+ * Size, File Type, Format, Resolution, Duration, Frame Rate, the audio/video
+ * codec/bit-rate/bit-depth fields, Color Space, Dynamic Range, Alpha Channel — are computed by
+ * Frame.io's media pipeline from the file itself, so they are intentionally
+ * left alone. Fields with no natural mapping (Assignee, Seen By, Rating,
+ * Prompt, Transcript, Page Count, the 3D fields, Start/End Time) are skipped
+ * rather than filled with invented values. Never fails the upload; returns the
+ * list of field names actually set.
+ */
+function gbirds_frameio_apply_custom_fields(string $accessToken, string $accountId, string $projectId, string $fileId, array $harvested, string $originalFilename, string $description = '', ?array &$debug = null): array {
+    $debug = ['attempts' => []];
+    $applied = [];
+    if ($fileId === '' || $accountId === '' || $projectId === '') return $applied;
+
+    $defs = gbirds_frameio_resolve_metadata_field_defs($accessToken, $accountId);
+    if (empty($defs)) return $applied;
+
+    $wanted = [];
+    $keywordBits = array_values(array_filter([
+        $harvested['Species'] ?? '',
+        $harvested['Scientific name'] ?? '',
+        $harvested['Feeder type'] ?? '',
+        $harvested['Origin'] ?? '',
+        $harvested['Feed type'] ?? '',
+        (!empty($harvested['Mystery visitor']) ? 'Mystery visitor' : ''),
+        (!empty($harvested['Shared to community']) ? 'Shared to community' : '')
+    ], function ($v) { return trim((string)$v) !== ''; }));
+    if ($keywordBits) {
+        $wanted['keywords'] = $keywordBits;
+    } elseif (trim($description) !== '') {
+        // No species/feeder tags harvested — fall back to the same comment text
+        // as the Keywords value rather than leaving the field unset.
+        $wanted['keywords'] = trim($description);
+    }
+    if (!empty($harvested['Owner'])) $wanted['uploader'] = (string)$harvested['Owner'];
+    if (!empty($harvested['Feeder model'])) $wanted['model'] = (string)$harvested['Feeder model'];
+    if ($originalFilename !== '') $wanted['source filename'] = $originalFilename;
+    $notesLines = [];
+    foreach ($harvested as $k => $v) {
+        if (is_scalar($v) && trim((string)$v) !== '') $notesLines[] = $k . ': ' . trim((string)$v);
+    }
+    if ($notesLines) $wanted['notes'] = implode("\n", $notesLines);
+
+    $cfg = gbirds_frameio_config();
+    $url = $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($projectId) . '/metadata/values';
+
+    foreach ($wanted as $fname => $value) {
+        $def = $defs[$fname] ?? null;
+        if (!$def || empty($def['field_id']) || (($def['mutable'] ?? true) === false)) continue;
+
+        $candidates = [];
+        if (is_array($value)) { $candidates[] = $value; $candidates[] = implode(', ', $value); }
+        else { $candidates[] = $value; $candidates[] = [$value]; }
+        // Select-type fields need the resolved option id, not free text.
+        if (!empty($def['options'])) {
+            $lookupLabel = is_array($value) ? (string)($value[0] ?? '') : (string)$value;
+            $optId = $def['options'][strtolower(trim($lookupLabel))] ?? '';
+            if ($optId !== '') array_unshift($candidates, $optId);
+        }
+
+        foreach ($candidates as $val) {
+            try {
+                [$st, $data] = gbirds_frameio_http(
+                    'PATCH',
+                    $url,
+                    ['data' => ['asset_ids' => [$fileId], 'values' => [['field_definition_id' => $def['field_id'], 'value' => $val]]]],
+                    $accessToken,
+                    ['api-version: experimental']
+                );
+            } catch (Throwable $e) {
+                $debug['attempts'][] = ['field' => $fname, 'error' => $e->getMessage()];
+                continue;
+            }
+            $debug['attempts'][] = ['field' => $fname, 'value' => $val, 'http' => $st, 'body' => substr((string)json_encode($data), 0, 800)];
+            if ($st >= 200 && $st < 300) { $applied[] = $fname; break; }
+            if ($st === 403) break;
+        }
+    }
+    if (!empty($applied)) $debug['applied'] = $applied;
+    error_log('GetBirds Frame.io custom-fields attempts: ' . json_encode($debug['attempts']));
+    return $applied;
+}
+
+/**
+ * Set a file's Status metadata (e.g. "Needs Review") after upload. The built-in
+ * Status field's accepted values are SLUGS: none / in_progress / needs_review /
+ * approved. We send the slug (the most likely form), then fall back to other
+ * shapes (scalar/array, and the resolved option UUID) until one is accepted.
+ * Best-effort: never fails the upload.
+ */
+function gbirds_frameio_set_status(string $accessToken, string $accountId, string $projectId, string $fileId, string $label = 'Needs Review', ?array &$debug = null): bool {
+    $debug = ['fieldId' => '', 'optionKeys' => [], 'attempts' => []];
+    if ($fileId === '' || $accountId === '' || $projectId === '') { $debug['error'] = 'missing ids'; return false; }
+    try {
+        $field = gbirds_frameio_resolve_status_field($accessToken, $accountId);
+        $debug['fieldId'] = $field['field_id'] ?? '';
+        $debug['optionKeys'] = array_keys($field['options'] ?? []);
+        if (empty($field['field_id'])) { $debug['error'] = 'status field not resolved'; return false; }
+
+        // "Needs Review" → "needs_review" (the field's enum value slug).
+        $slug = strtolower(preg_replace('/\s+/', '_', trim($label)));
+        $optId = $field['options'][strtolower(trim($label))] ?? '';
+
+        // Try the most likely value shapes in order; stop at the first that sticks.
+        $candidates = [[$slug], $slug];
+        if ($optId !== '' && $optId !== $slug) { $candidates[] = [$optId]; $candidates[] = $optId; }
+
+        $cfg = gbirds_frameio_config();
+        $url = $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($projectId) . '/metadata/values';
+        foreach ($candidates as $val) {
+            [$status, $data] = gbirds_frameio_http(
+                'PATCH',
+                $url,
+                ['data' => ['asset_ids' => [$fileId], 'values' => [['field_definition_id' => $field['field_id'], 'value' => $val]]]],
+                $accessToken,
+                ['api-version: experimental']
+            );
+            $debug['attempts'][] = ['value' => $val, 'http' => $status, 'body' => substr((string)json_encode($data), 0, 800)];
+            if ($status >= 200 && $status < 300) return true;
+            // 403 = account-level-metadata permission; retrying other shapes won't help.
+            if ($status === 403) break;
+        }
+        error_log('GetBirds Frame.io set-status failed: ' . json_encode($debug['attempts']));
+        return false;
+    } catch (Throwable $e) {
+        $debug['error'] = $e->getMessage();
+        error_log('GetBirds Frame.io set-status exception: ' . $e->getMessage());
+        return false;
+    }
+}
+
 /**
  * Ensure a date-named folder (Y-m-d) exists directly under Project_FIREBIRD's
  * root folder, creating it when missing. Frame.io V4 exposes no public
@@ -780,7 +1209,9 @@ function gbirds_frameio_start_auth_for_pending(array $pending): void {
         'filename' => trim((string)($pending['filename'] ?? '')),
         'createdAt' => trim((string)($pending['createdAt'] ?? '')),
         'species' => trim((string)($pending['species'] ?? '')),
-        'postcardId' => trim((string)($pending['postcardId'] ?? ''))
+        'postcardId' => trim((string)($pending['postcardId'] ?? '')),
+        'description' => gbirds_frameio_clean_description($pending['description'] ?? ''),
+        'metadata' => gbirds_frameio_sanitize_metadata_map($pending['metadata'] ?? [])
     ];
     // A deliberate first-click authentication gate: discard any old Frame.io
     // token so the Adobe IMS flow cannot silently reuse the wrong profile.
@@ -823,6 +1254,8 @@ function gbirds_frameio_send(): void {
     $createdAt = trim((string)($input['createdAt'] ?? ''));
     $species = trim((string)($input['species'] ?? ''));
     $postcardId = trim((string)($input['postcardId'] ?? ''));
+    $description = gbirds_frameio_clean_description($input['description'] ?? '');
+    $metadata = gbirds_frameio_sanitize_metadata_map($input['metadata'] ?? []);
     if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
         gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
     }
@@ -839,7 +1272,9 @@ function gbirds_frameio_send(): void {
             'filename'=>$filename,
             'createdAt'=>$createdAt,
             'species'=>$species,
-            'postcardId'=>$postcardId
+            'postcardId'=>$postcardId,
+            'description'=>$description,
+            'metadata'=>$metadata
         ]);
     }
 
@@ -851,7 +1286,9 @@ function gbirds_frameio_send(): void {
             'filename'=>$filename,
             'createdAt'=>$createdAt,
             'species'=>$species,
-            'postcardId'=>$postcardId
+            'postcardId'=>$postcardId,
+            'description'=>$description,
+            'metadata'=>$metadata
         ];
         gbirds_json_response([
             'ok'=>false,
@@ -945,6 +1382,13 @@ function gbirds_frameio_send(): void {
         $existingFileId = gbirds_frameio_find_child_file_by_name($token, $dupChildrenUrl, $remoteName);
         if ($existingFileId !== '') {
             $dupViewUrl = 'https://next.frame.io/project/' . rawurlencode($cfg['project_id']) . '/view/' . rawurlencode($existingFileId);
+            // Backfill Status on the already-uploaded asset too (existing assets
+            // currently have no Status set).
+            $dupStatusDebug = null;
+            $dupStatusSet = gbirds_frameio_set_status($token, $accountId, $cfg['project_id'], $existingFileId, 'Needs Review', $dupStatusDebug);
+            // Backfill the other custom fields too, same as a fresh upload.
+            $dupCustomFieldsDebug = null;
+            $dupCustomFieldsSet = gbirds_frameio_apply_custom_fields($token, $accountId, $cfg['project_id'], $existingFileId, $metadata, $filename, $description, $dupCustomFieldsDebug);
             unset($_SESSION['frameio_pending_upload']);
             gbirds_json_response([
                 'ok'=>true,
@@ -957,6 +1401,10 @@ function gbirds_frameio_send(): void {
                 'dateName'=>$dateName,
                 'file'=>['id'=>$existingFileId,'name'=>$remoteName],
                 'viewUrl'=>$dupViewUrl,
+                'statusSet'=>$dupStatusSet,
+                'statusDebug'=>$dupStatusDebug,
+                'customFieldsSet'=>$dupCustomFieldsSet,
+                'customFieldsDebug'=>$dupCustomFieldsDebug,
                 'projectUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id'])
             ]);
         }
@@ -976,7 +1424,9 @@ function gbirds_frameio_send(): void {
                 'filename'=>$filename,
                 'createdAt'=>$createdAt,
                 'species'=>$species,
-                'postcardId'=>$postcardId
+                'postcardId'=>$postcardId,
+                'description'=>$description,
+                'metadata'=>$metadata
             ];
             try {
                 $authorizeUrl = gbirds_frameio_authorize_url();
@@ -1012,6 +1462,31 @@ function gbirds_frameio_send(): void {
         } else {
             $viewUrl = $apiViewUrl;
         }
+
+        // Attach ALL harvested BirdBuddy metadata to the asset. Frame.io V4 files
+        // have no writable description field, so we post it as a comment (best-effort).
+        $metadataAttached = false;
+        if ($fileId !== '' && $description !== '') {
+            $metadataAttached = gbirds_frameio_add_comment($token, $accountId, $fileId, $description);
+        }
+
+        // Set the asset's workflow Status to "Needs Review" so downstream review
+        // workflows can key off it (best-effort; never fails the upload).
+        $statusSet = false;
+        $statusDebug = null;
+        if ($fileId !== '') {
+            $statusSet = gbirds_frameio_set_status($token, $accountId, $cfg['project_id'], $fileId, 'Needs Review', $statusDebug);
+        }
+
+        // Fill every OTHER custom field that can be reasonably derived from the
+        // harvested BirdBuddy data (Keywords, Notes, Uploader, Model, Source
+        // Filename) — best-effort; never fails the upload.
+        $customFieldsSet = [];
+        $customFieldsDebug = null;
+        if ($fileId !== '') {
+            $customFieldsSet = gbirds_frameio_apply_custom_fields($token, $accountId, $cfg['project_id'], $fileId, $metadata, $filename, $description, $customFieldsDebug);
+        }
+
         unset($_SESSION['frameio_pending_upload']);
         gbirds_json_response([
             'ok'=>true,
@@ -1025,6 +1500,11 @@ function gbirds_frameio_send(): void {
             'folderName'=>$dateName,
             'file'=>$fileData,
             'viewUrl'=>$viewUrl,
+            'metadataAttached'=>$metadataAttached,
+            'statusSet'=>$statusSet,
+            'statusDebug'=>$statusDebug,
+            'customFieldsSet'=>$customFieldsSet,
+            'customFieldsDebug'=>$customFieldsDebug,
             'projectUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id']),
             'links'=>$upload['links'] ?? null
         ]);
@@ -1221,6 +1701,41 @@ function gbirds_frameio_collections_debug(): void {
     }
 }
 
+function gbirds_frameio_status_fields_debug(): void {
+    try {
+        $token = gbirds_frameio_access_token();
+        $cfg = gbirds_frameio_config();
+        [$project, $accountId] = gbirds_frameio_find_project($token);
+        [$status, $data] = gbirds_frameio_http(
+            'GET',
+            $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/metadata/field_definitions',
+            null,
+            $token,
+            ['api-version: experimental']
+        );
+        $resolved = gbirds_frameio_resolve_status_field($token, $accountId);
+        $fieldNames = [];
+        $rawStatusField = null;
+        foreach (($data['data'] ?? []) as $f) {
+            if (!is_array($f)) continue;
+            $nm = (string)($f['name'] ?? $f['field_name'] ?? $f['title'] ?? '');
+            $fieldNames[] = $nm;
+            if (strtolower(trim($nm)) === 'status') $rawStatusField = $f;
+        }
+        gbirds_json_response([
+            'ok'=>true,
+            'accountId'=>$accountId,
+            'httpStatus'=>$status,
+            'fieldCount'=>is_array($data['data'] ?? null) ? count($data['data']) : 0,
+            'fieldNames'=>$fieldNames,
+            'resolvedStatusField'=>$resolved,
+            'rawStatusField'=>$rawStatusField
+        ]);
+    } catch (Throwable $e) {
+        gbirds_json_response(['ok'=>false,'error'=>$e->getMessage(),'stage'=>'frameio-status-fields-debug'],500);
+    }
+}
+
 function gbirds_firebird_placeholder(): void {
     gbirds_json_response([
         'ok' => false,
@@ -1243,6 +1758,7 @@ if (!empty($_GET['frameio_resume'])) {
 $api = strtolower(trim((string)($_GET['api'] ?? '')));
 if ($api === 'birdbuddy') gbirds_proxy_graphql();
 if ($api === 'birdbuddy-media') gbirds_proxy_media();
+if ($api === 'hls-proxy') gbirds_hls_proxy();
 if ($api === 'frameio-auth-begin') gbirds_frameio_begin_auth();
 if ($api === 'frameio-auth-reset') {
     gbirds_frameio_clear_session();
@@ -1258,6 +1774,7 @@ if ($api === 'frameio-resume-send') gbirds_frameio_resume_send();
 if ($api === 'frameio-auth-config') gbirds_frameio_auth_config();
 if ($api === 'frameio-debug') gbirds_frameio_debug();
 if ($api === 'frameio-collections-debug') gbirds_frameio_collections_debug();
+if ($api === 'frameio-status-fields-debug') gbirds_frameio_status_fields_debug();
 if ($api === 'frameio-logout') { gbirds_frameio_clear_session(); gbirds_json_response(['ok'=>true]); }
 if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 ?>
@@ -2074,6 +2591,134 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     .btn-tv:hover { color: var(--accent); }
     .btn-tv .tv-icon { display: block; }
 
+    .btn-live {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.35rem 0.6rem;
+      margin-left: 0.25rem;
+      border-radius: var(--radius-sm);
+      font-weight: 700;
+      font-size: 0.72rem;
+      letter-spacing: 0.04em;
+      color: #fff;
+      background: #c8322b;
+    }
+    .btn-live:hover { background: #e0453d; }
+    .btn-live[disabled], .btn-live.busy { opacity: 0.6; cursor: default; }
+
+    /* WHO DAT?!? — Identify Visitor (New Orleans Saints gold & black homage). */
+    .btn-whodat {
+      background: #d3bc8d;
+      color: #101820;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      border: 1px solid #101820;
+    }
+    .btn-whodat:hover { background: #e7d3a1; color: #101820; }
+    .btn-whodat.uploading { opacity: 0.7; pointer-events: none; }
+
+    /* Clickable profile avatar → My Media (saved) view. */
+    .avatar { transition: box-shadow 0.15s ease, outline-color 0.15s ease; }
+    .avatar.avatar-active { outline: 2px solid var(--accent, #4c8bf5); outline-offset: 2px; box-shadow: 0 0 0 3px rgba(76,139,245,0.25); }
+
+    /* Community level 1 — species collection cards */
+    .species-collection-grid {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 1.25rem;
+      width: 100%;
+    }
+    .species-collection-card {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 0;
+      border: none;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+      color: inherit;
+    }
+    .species-collection-img {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      border-radius: 14px;
+      overflow: hidden;
+      background: rgba(127,127,127,0.15);
+    }
+    .species-collection-img img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.2s ease; }
+    .species-collection-card:hover .species-collection-img img { transform: scale(1.03); }
+    .species-collection-new {
+      position: absolute; top: 0.6rem; left: 0.6rem;
+      background: #2e9e5b; color: #fff; font-weight: 800; font-size: 0.7rem;
+      letter-spacing: 0.06em; padding: 0.2rem 0.55rem; border-radius: 6px;
+    }
+    .species-collection-name { font-size: 1.15rem; font-weight: 700; line-height: 1.2; }
+    .species-collection-meta { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .scm-chip {
+      font-size: 0.8rem; color: var(--text-soft, #b26a3a);
+      border: 1px solid rgba(178,106,58,0.35); border-radius: 999px;
+      padding: 0.15rem 0.6rem; white-space: nowrap;
+    }
+    .community-back-bar {
+      grid-column: 1 / -1;
+      display: flex; align-items: center; gap: 0.75rem;
+      width: 100%; margin-bottom: 0.25rem;
+    }
+    .community-back-title { font-size: 1.15rem; font-weight: 700; }
+    .live-dot {
+      width: 0.5rem;
+      height: 0.5rem;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 0 0 rgba(255,255,255,0.7);
+      animation: gbLivePulse 1.6s infinite;
+    }
+    @keyframes gbLivePulse {
+      0% { box-shadow: 0 0 0 0 rgba(255,255,255,0.6); }
+      70% { box-shadow: 0 0 0 6px rgba(255,255,255,0); }
+      100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+    }
+    .getbirds-tv-livebadge {
+      position: absolute;
+      top: 1.2rem;
+      left: 1.2rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.3rem 0.6rem;
+      border-radius: 4px;
+      background: #c8322b;
+      color: #fff;
+      font-weight: 800;
+      font-size: 0.8rem;
+      letter-spacing: 0.08em;
+      z-index: 6;
+    }
+    .getbirds-tv-livebadge.hidden { display: none !important; }
+    .getbirds-tv-livemsg {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.6rem;
+      text-align: center;
+      padding: 2rem;
+      color: #f4f4f5;
+      font-size: 1.2rem;
+      line-height: 1.4;
+      background: radial-gradient(circle at center, #16181d 0%, #0b0c0f 100%);
+      z-index: 5;
+    }
+    .getbirds-tv-livemsg .livemsg-emoji { font-size: 2.6rem; }
+    .getbirds-tv-livemsg .livemsg-sub { font-size: 0.95rem; color: #b6b8bd; }
+    .getbirds-tv-livemsg.hidden { display: none !important; }
+
     .getbirds-tv-overlay {
       position: fixed;
       inset: 0;
@@ -2283,6 +2928,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
           <button type="button" id="getbirdsTvBtn" class="btn btn-tv" title="GetBirds.TV — Live stream visible postcard videos" aria-label="Open GetBirds.TV">
             <svg class="tv-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/></svg>
           </button>
+          <button type="button" id="getbirdsLiveBtn" class="btn btn-live" title="GO LIVE — BirdBuddy live camera feed" aria-label="Go live to the BirdBuddy camera">
+            <span class="live-dot" aria-hidden="true"></span>GO LIVE
+          </button>
         </div>
         <div id="headerStatus" class="header-status" aria-live="polite"></div>
         <div class="header-actions">
@@ -2332,10 +2980,12 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       <div class="getbirds-tv-video-wrap">
         <video id="getbirdsTvVideo" class="getbirds-tv-video" autoplay playsinline></video>
         <img id="getbirdsTvImage" class="getbirds-tv-image hidden" alt="" />
+        <div id="getbirdsTvLiveMsg" class="getbirds-tv-livemsg hidden" role="status" aria-live="polite"></div>
       </div>
       <div id="getbirdsTvNextPanel" class="getbirds-tv-panel getbirds-tv-next" aria-label="Play next" role="button" tabindex="0"></div>
     </div>
     <div class="getbirds-tv-overlays">
+      <div id="getbirdsTvLiveBadge" class="getbirds-tv-livebadge hidden" aria-hidden="true"><span class="live-dot"></span>LIVE</div>
       <div class="getbirds-tv-bug" aria-hidden="true">GetBirds.TV</div>
       <div class="getbirds-tv-banner" aria-hidden="true">GetBirds.TV by HH5HH</div>
       <div id="getbirdsTvLowerThird" class="getbirds-tv-lower-third" aria-hidden="true"></div>
@@ -2362,6 +3012,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const BB_GRAPHQL_OVERRIDE_QUERY_KEYS = ["bb_graphql", "bbGraphql", "graphql"];
   const BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS = ["bb_graphql_direct", "bbGraphqlDirect"];
   const BIRDBUDDY_MEDIA_PROXY = "./gbirds.php?api=birdbuddy-media";
+  const HLS_PROXY = "./gbirds.php?api=hls-proxy&url=";
   const FRAMEIO_USAGE_KEY = "firebird_firebird_frameio_usage_id_v4";
   const FRAMEIO_BEGIN_USAGE = "./gbirds.php?api=frameio-begin-usage";
   const GBIRDS_FRAMEIO_BASE = "https://hh5hh.com/gbirds.php";
@@ -2480,9 +3131,12 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const youtubeModalClose = $("youtubeModalClose");
   const youtubeModalOpenStudio = $("youtubeModalOpenStudio");
   const getbirdsTvBtn = $("getbirdsTvBtn");
+  const getbirdsLiveBtn = $("getbirdsLiveBtn");
   const getbirdsTvOverlay = $("getbirdsTvOverlay");
   const getbirdsTvVideo = $("getbirdsTvVideo");
   const getbirdsTvImage = $("getbirdsTvImage");
+  const getbirdsTvLiveMsg = $("getbirdsTvLiveMsg");
+  const getbirdsTvLiveBadge = $("getbirdsTvLiveBadge");
   const getbirdsTvPrevPanel = $("getbirdsTvPrevPanel");
   const getbirdsTvNextPanel = $("getbirdsTvNextPanel");
   const getbirdsTvClose = $("getbirdsTvClose");
@@ -2537,6 +3191,14 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   var allPostcards = [];
   var allCameras = [];
   var cameraFilter = "All";
+  // Feed mode: "inbox" = default non-expired postcards; "community" = the two-level
+  // species-collection browser (reached by clicking the profile avatar).
+  //   communityLevel "species"   → grid of species you've collected (level 1)
+  //   communityLevel "postcards" → the postcards inside one species (level 2)
+  var feedMode = "inbox";
+  var communityLevel = "species";
+  var communityCollectionId = "";
+  var communityCollectionName = "";
   var speciesFilter = null;
   var speciesQueryMode = "species";
   var deferSpeciesFilterRefresh = false;
@@ -3114,6 +3776,11 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
   function resetLoggedInUI() {
     setHeaderStatus("", false);
+    feedMode = "inbox";
+    communityLevel = "species";
+    communityCollectionId = "";
+    communityCollectionName = "";
+    if (avatar) avatar.classList.remove("avatar-active");
     allPostcards = [];
     allCameras = [];
     cameraFilter = "All";
@@ -3213,6 +3880,67 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     mediaError.hidden = true;
     mediaEmpty.hidden = true;
     updateFooter();
+    feedMode = "inbox";
+    communityLevel = "species";
+    if (avatar) avatar.classList.remove("avatar-active");
+    fetchBirdBuddyFeed();
+  }
+
+  function clearFeedGrid(statusText) {
+    allPostcards = [];
+    if (mediaGrid) mediaGrid.innerHTML = "";
+    loadMoreCursor = null;
+    hasMore = false;
+    if (loadMoreBtn) loadMoreBtn.hidden = true;
+    if (loadAllBtn) loadAllBtn.hidden = true;
+    if (mediaEmpty) mediaEmpty.hidden = true;
+    if (mediaError) mediaError.hidden = true;
+    if (mediaStatus) { mediaStatus.hidden = false; mediaStatus.textContent = statusText || "Loading…"; }
+    updateFooter();
+  }
+
+  // Enter/leave the Community (species-collection) view via the profile avatar.
+  function switchFeedMode(mode) {
+    if (mode !== "inbox" && mode !== "community") mode = "inbox";
+    if (busy) return;
+    feedMode = mode;
+    communityLevel = "species";
+    communityCollectionId = "";
+    communityCollectionName = "";
+    clearFeedGrid(mode === "community" ? "Loading your collection…" : "Loading postcards…");
+    if (avatar) avatar.classList.toggle("avatar-active", mode === "community");
+    setHeaderStatus(mode === "community" ? "Community — species you’ve collected. Tap a species to see its postcards." : "New postcards on your camera.", false);
+    fetchBirdBuddyFeed();
+  }
+  function toggleMyMediaFeed() {
+    // From a species' postcards, the avatar steps back up to the species grid;
+    // otherwise it toggles Community on/off.
+    if (feedMode === "community" && communityLevel === "postcards") { openCommunitySpeciesList(); return; }
+    switchFeedMode(feedMode === "community" ? "inbox" : "community");
+  }
+
+  // Level 1 → Level 2: open one species collection's postcards.
+  function openSpeciesCollection(collection) {
+    if (!collection || !collection.id || busy) return;
+    feedMode = "community";
+    communityLevel = "postcards";
+    communityCollectionId = collection.id;
+    communityCollectionName = collection.name || "Species";
+    clearFeedGrid("Loading " + communityCollectionName + " postcards…");
+    if (avatar) avatar.classList.add("avatar-active");
+    setHeaderStatus(communityCollectionName + " — your postcards.", false);
+    fetchBirdBuddyFeed();
+  }
+  // Level 2 → Level 1: back to the species grid.
+  function openCommunitySpeciesList() {
+    if (busy) return;
+    feedMode = "community";
+    communityLevel = "species";
+    communityCollectionId = "";
+    communityCollectionName = "";
+    clearFeedGrid("Loading your collection…");
+    if (avatar) avatar.classList.add("avatar-active");
+    setHeaderStatus("Community — species you’ve collected. Tap a species to see its postcards.", false);
     fetchBirdBuddyFeed();
   }
 
@@ -3835,6 +4563,32 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return out;
   }
 
+  // Richer species harvest for Frame.io metadata: keeps common name + scientific
+  // name + species id (deduped) from every place BirdBuddy exposes them.
+  function extractSpeciesDetailed(node) {
+    var out = [];
+    var seen = {};
+    function add(sp) {
+      if (!sp || typeof sp !== "object") return;
+      var name = canonicalizeSpeciesLabel(sp.name || "");
+      var sci = (sp.scientificName || "").toString().trim();
+      var id = (sp.id || "").toString().trim();
+      if (!name && !sci) return;
+      var key = (name || sci).toLowerCase();
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({ name: name || "", scientificName: sci, id: id });
+    }
+    if (!node) return out;
+    var a = node.mediaSpeciesAssignedName;
+    if (a) { if (a.species) add(a.species); else add(a); }
+    var s = node.species;
+    if (Array.isArray(s)) s.forEach(add); else if (s) add(s);
+    var pv = node.sightingReportPreview, sg = pv && pv.sightings;
+    if (Array.isArray(sg)) sg.forEach(function (x) { if (x && x.species) add(x.species); });
+    return out;
+  }
+
   function fetchInboxFeedWithSpeciesFallback(bbToken, after, useFilter) {
     var modes = ["species", "birds", "none"];
     if (speciesQueryMode === "birds") modes = ["birds", "none"];
@@ -3904,6 +4658,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         itemType: node.__typename || "",
         collected: node.__typename === "FeedItemCollectedPostcard",
         species: speciesNames,
+        speciesDetailed: extractSpeciesDetailed(node),
         medias: medias,
         feeder: feeder,
         feederId: feeder && feeder.id ? feeder.id : ""
@@ -3911,6 +4666,166 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     });
     return postcards;
   }
+
+  // ===== COMMUNITY (two-level species-collection browser, like the native app) =====
+  // Level 1: me.collections — the species groups YOU have collected (cover image,
+  // all-time visits, last visit). Level 2: collection(id).media — every individual
+  // postcard (MP4/JPG) in that species group, rendered in the default postcard style.
+
+  // Level 1 — species collections list.
+  var ME_COLLECTIONS_QUERY = [
+    "query meCollections {",
+    "  me { collections {",
+    "    __typename",
+    "    ... on CollectionBird {",
+    "      id markedAsNew visitsAllTime visitLastTime",
+    "      species { __typename ... on SpeciesBird { id name iconUrl } ... on SpeciesBirdFamily { id name iconUrl } ... on SpeciesBirdGenus { id name iconUrl } ... on SpeciesBirdOrder { id name iconUrl } }",
+    "      coverCollectionMedia { id media { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } species { __typename id name iconUrl } }",
+    "    }",
+    "    ... on CollectionMysteryVisitor {",
+    "      id markedAsNew visitsAllTime visitLastTime",
+    "      coverCollectionMedia { id media { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } species { __typename id name iconUrl } }",
+    "    }",
+    "  } }",
+    "}"
+  ].join(" ");
+
+  // Level 2 — every postcard/media inside one species collection.
+  var ME_COLLECTION_MEDIA_FIELDS =
+    "{ edges { node { id feederName liked likes isShared locationCity locationCountry owning ownerName origin isMysteryVisitor " +
+    "media { __typename id createdAt thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) width height } ... on MediaVideo { contentUrl(size: ORIGINAL) quality width height } } " +
+    "species { __typename id iconUrl name } } } pageInfo { hasNextPage endCursor } }";
+  var ME_COLLECTION_MEDIA_QUERY = [
+    "query meCollectionsMedia($collectionId: ID!, $first: Int, $after: String, $orderBy: MediaOrderByInput) {",
+    "  collection(collectionId: $collectionId) {",
+    "    __typename",
+    "    ... on CollectionBird { id media(first: $first, after: $after, orderBy: $orderBy) " + ME_COLLECTION_MEDIA_FIELDS + " }",
+    "    ... on CollectionMysteryVisitor { id media(first: $first, after: $after, orderBy: $orderBy) " + ME_COLLECTION_MEDIA_FIELDS + " }",
+    "  }",
+    "}"
+  ].join(" ");
+
+  function fetchMeCollections(bbToken) {
+    return bbGraphql({ operationName: "meCollections", variables: {}, query: ME_COLLECTIONS_QUERY }, bbToken)
+      .then(function (r) { return r.json().then(function (data) {
+        if (data && data.errors && data.errors.length) {
+          var err = data.errors[0];
+          var e = new Error(err.message || "Could not load your collections.");
+          e.isAuthError = isBirdBuddyAuthError(err.extensions && err.extensions.code, err.message || "");
+          throw e;
+        }
+        return data;
+      }); });
+  }
+
+  function fetchCollectionMedia(bbToken, collectionId, after) {
+    return bbGraphql({
+      operationName: "meCollectionsMedia",
+      variables: { collectionId: collectionId, first: 30, after: after || null, orderBy: { createdAt: "DESC" } },
+      query: ME_COLLECTION_MEDIA_QUERY
+    }, bbToken).then(function (r) { return r.json().then(function (data) {
+      if (data && data.errors && data.errors.length) {
+        var err = data.errors[0];
+        var e = new Error(err.message || "Could not load this species' postcards.");
+        e.isAuthError = isBirdBuddyAuthError(err.extensions && err.extensions.code, err.message || "");
+        throw e;
+      }
+      return data;
+    }); });
+  }
+
+  // Normalize a species collection (level 1) for the species-card grid.
+  function normalizeCollection(node) {
+    if (!node || !node.id) return null;
+    var isMystery = node.__typename === "CollectionMysteryVisitor";
+    var sp = node.species;
+    if (Array.isArray(sp)) sp = sp[0];
+    var name = (sp && sp.name) || (node.coverCollectionMedia && Array.isArray(node.coverCollectionMedia.species) && node.coverCollectionMedia.species[0] && node.coverCollectionMedia.species[0].name) || (isMystery ? "Mystery Visitor" : "Unknown");
+    var cover = node.coverCollectionMedia && node.coverCollectionMedia.media;
+    var img = cover && (cover.thumbnailUrl || cover.contentUrl) || "";
+    return {
+      id: node.id,
+      name: name,
+      isMystery: isMystery,
+      isNew: !!node.markedAsNew,
+      visits: (typeof node.visitsAllTime === "number" ? node.visitsAllTime : null),
+      lastVisit: node.visitLastTime || "",
+      cover: img
+    };
+  }
+
+  function collectSpeciesCollections(data) {
+    var out = [];
+    var cols = data && data.data && data.data.me && data.data.me.collections;
+    if (!Array.isArray(cols)) return out;
+    cols.forEach(function (c) { var n = normalizeCollection(c); if (n) out.push(n); });
+    return out;
+  }
+
+  // Map one CollectionMedia node (level 2) into gbirds' postcard shape.
+  function mapCollectionMediaNode(node) {
+    var m = node && node.media;
+    if (!node || !m) return null;
+    var url = m.contentUrl || m.thumbnailUrl;
+    if (!url) return null;
+    var isVideo = m.__typename === "MediaVideo" || (!!m.contentUrl && m.contentUrl.indexOf(".mp4") !== -1);
+    var speciesNames = extractSpeciesNames(node);
+    if (!speciesNames.length) speciesNames.push(UNKNOWN_SPECIES_LABEL);
+    return {
+      id: node.id,
+      createdAt: (m.createdAt || node.createdAt),
+      expiresAt: null,
+      itemType: "FeedItemCollectedPostcard",
+      collected: true,
+      savedMedia: true,
+      ownerName: node.ownerName || "",
+      origin: node.origin || "",
+      likes: (typeof node.likes === "number" ? node.likes : null),
+      isShared: !!node.isShared,
+      isMysteryVisitor: !!node.isMysteryVisitor,
+      species: speciesNames,
+      speciesDetailed: extractSpeciesDetailed(node),
+      medias: [{ url: url, thumb: m.thumbnailUrl, id: m.id, sourceIndex: 0, isVideo: isVideo, width: m.width || null, height: m.height || null, quality: m.quality || "" }],
+      feeder: { id: "", name: node.feederName || "", type: "", housingType: "", version: "", city: node.locationCity || "", country: node.locationCountry || "" },
+      feederId: ""
+    };
+  }
+
+  function collectPostcardsFromCollectionMedia(data) {
+    var postcards = [];
+    var col = data && data.data && data.data.collection;
+    var conn = col && col.media;
+    var edges = conn && conn.edges;
+    if (!Array.isArray(edges)) return postcards;
+    edges.forEach(function (edge) {
+      var pc = mapCollectionMediaNode(edge && edge.node);
+      if (pc) postcards.push(pc);
+    });
+    return postcards;
+  }
+
+  // ---- Identify Visitor ("WHO DAT?!?") — re-run BirdBuddy inference on a postcard
+  // to identify a Mystery Visitor, exactly like the native app's identify action.
+  var INFERENCE_REANALYZE_MUTATION = [
+    "mutation inferenceExternalPostcardReanalyze($feedItemId: ID!) {",
+    "  inferenceExternalPostcardReanalyze(feedItemId: $feedItemId) {",
+    "    updatedFeedItem {",
+    "      __typename id createdAt",
+    "      ... on FeedItemNewPostcard {",
+    "        reanalyzeAvailability mediaSpeciesNameIdentificationConfidenceLevel",
+    "        mediaSpeciesAssignedName { id name species { id name scientificName } }",
+    "        sightingReportPreview { sightings {",
+    "          __typename",
+    "          ... on SightingRecognizedBird { id species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } }",
+    "          ... on SightingRecognizedBirdUnlocked { id species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } }",
+    "          ... on SightingRecognizedMysteryVisitor { id }",
+    "        } }",
+    "      }",
+    "    }",
+    "    __typename",
+    "  }",
+    "}"
+  ].join(" ");
 
   function mediaSummary(medias) {
     var images = 0, videos = 0;
@@ -4172,7 +5087,68 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     button.textContent = collected ? "Saved to collection" : "Save to collection";
   }
 
+  function formatDaysAgo(value) {
+    if (!value) return "";
+    var t = new Date(value).getTime();
+    if (isNaN(t)) return "";
+    var days = Math.max(0, Math.floor((Date.now() - t) / 86400000));
+    if (days === 0) return "today";
+    if (days === 1) return "1 day ago";
+    return days + " days ago";
+  }
+
+  // Level 1 renderer — species-collection cards (cover image, name, days-ago, visits).
+  function renderSpeciesCollections(collections) {
+    if (!mediaGrid) return;
+    mediaGrid.innerHTML = "";
+    var grid = document.createElement("div");
+    grid.className = "species-collection-grid";
+    collections.forEach(function (c) {
+      var card = document.createElement("button");
+      card.type = "button";
+      card.className = "species-collection-card";
+      card.setAttribute("data-collection-id", c.id);
+      var imgWrap = document.createElement("div");
+      imgWrap.className = "species-collection-img";
+      if (c.cover) { var im = document.createElement("img"); im.src = c.cover; im.alt = c.name; im.loading = "lazy"; imgWrap.appendChild(im); }
+      if (c.isNew) { var badge = document.createElement("span"); badge.className = "species-collection-new"; badge.textContent = "NEW"; imgWrap.appendChild(badge); }
+      card.appendChild(imgWrap);
+      var title = document.createElement("div");
+      title.className = "species-collection-name";
+      title.textContent = c.name;
+      card.appendChild(title);
+      var metaRow = document.createElement("div");
+      metaRow.className = "species-collection-meta";
+      var da = formatDaysAgo(c.lastVisit);
+      if (da) { var d = document.createElement("span"); d.className = "scm-chip"; d.textContent = "🕗 " + da; metaRow.appendChild(d); }
+      if (typeof c.visits === "number") { var v = document.createElement("span"); v.className = "scm-chip"; v.textContent = "🪶 " + c.visits + " visit" + (c.visits === 1 ? "" : "s"); metaRow.appendChild(v); }
+      card.appendChild(metaRow);
+      card.addEventListener("click", function () { openSpeciesCollection(c); });
+      grid.appendChild(card);
+    });
+    mediaGrid.appendChild(grid);
+  }
+
+  function ensureCommunityBackBar() {
+    if (!mediaGrid || feedMode !== "community" || communityLevel !== "postcards") return;
+    if (mediaGrid.querySelector(".community-back-bar")) return;
+    var bar = document.createElement("div");
+    bar.className = "community-back-bar";
+    var back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn community-back-btn";
+    back.textContent = "← Back to species";
+    back.addEventListener("click", function () { openCommunitySpeciesList(); });
+    bar.appendChild(back);
+    var heading = document.createElement("span");
+    heading.className = "community-back-title";
+    heading.textContent = communityCollectionName || "";
+    bar.appendChild(heading);
+    mediaGrid.insertBefore(bar, mediaGrid.firstChild);
+  }
+
   function appendPostcardGroups(postcards) {
+    if (feedMode === "community" && communityLevel === "postcards") ensureCommunityBackBar();
     postcards.forEach(function (postcard) {
       allPostcards.push(postcard);
       var collectedState = isPostcardCollected(postcard);
@@ -4326,7 +5302,10 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       if (postcard.feeder && (postcard.feeder.city || postcard.feeder.country)) {
         meta.appendChild(metaRow("Location", formatCameraLocation(postcard.feeder)));
       }
-      meta.appendChild(metaRow("Species", formatSpeciesLabel(postcard)));
+      var speciesRow = metaRow("Species", formatSpeciesLabel(postcard));
+      var speciesRowVal = speciesRow.querySelector(".meta-value");
+      if (speciesRowVal) speciesRowVal.classList.add("species-meta-value");
+      meta.appendChild(speciesRow);
       meta.appendChild(metaCheckboxRow("Collected", collectedState, "data-collected-indicator"));
       meta.appendChild(metaRow("Created", formatPostcardDate(postcard.createdAt)));
       meta.appendChild(metaRow("Expires", formatPostcardDate(postcard.expiresAt)));
@@ -4366,8 +5345,29 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         saveYoutubeBtn.title = getYouTubeUploadBlockedMessage();
       }
       saveYoutubeBtn.addEventListener("click", function () { onSaveToYouTube(postcard, saveYoutubeBtn); });
+
+      // WHO DAT?!? — Identify Visitor. Offered when the bird is a Mystery Visitor /
+      // unidentified; re-runs BirdBuddy inference to name it, like the native app.
+      var whoDatBtn = null;
+      // Identify (reanalyze) only applies to NEW inbox postcards with an
+      // unidentified bird — the exact case the native app offers "identify" for.
+      // Collected/expired items or saved media aren't reanalyzable (BirdBuddy
+      // returns an internal error), so don't offer WHO DAT there.
+      if (feedMode === "inbox" && postcard.itemType === "FeedItemNewPostcard" && !postcardHasKnownSpecies(postcard)) {
+        whoDatBtn = document.createElement("button");
+        whoDatBtn.type = "button";
+        whoDatBtn.className = "btn btn-whodat";
+        whoDatBtn.textContent = "WHO DAT?!?";
+        whoDatBtn.title = "Identify this mystery visitor";
+        whoDatBtn.dataset.postcardId = postcard.id || "";
+        whoDatBtn.setAttribute("data-whodat-button", "true");
+        whoDatBtn.addEventListener("click", function () { onIdentifyVisitor(postcard, whoDatBtn); });
+      }
+
       actions.appendChild(downloadPostcardBtn);
-      actions.appendChild(saveCollectionBtn);
+      // My-media view items are already saved — no Save to collection there.
+      if (feedMode === "inbox") actions.appendChild(saveCollectionBtn);
+      if (whoDatBtn) actions.appendChild(whoDatBtn);
       actions.appendChild(saveYoutubeBtn);
       footer.appendChild(actions);
       wrap.appendChild(footer);
@@ -4378,10 +5378,31 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   function fetchBirdBuddyFeed() {
     var googleToken = localStorage.getItem(STORAGE_KEYS.googleAccessToken);
 
+    var isCommunitySpecies = feedMode === "community" && communityLevel === "species";
+
     function applyFeedResponse(data) {
-      var postcards = collectPostcardsFromFeed(data);
-      var feed = data.data && data.data.me && data.data.me.feed;
-      var pageInfo = feed && feed.pageInfo;
+      if (isCommunitySpecies) {
+        // Level 1: render the species-collection grid (no infinite scroll).
+        var collections = collectSpeciesCollections(data);
+        hasMore = false; loadMoreCursor = null;
+        renderSpeciesCollections(collections);
+        mediaStatus.hidden = true;
+        if (collections.length === 0) { mediaEmpty.hidden = false; mediaEmpty.textContent = "You haven’t collected any species yet."; }
+        updateFooter();
+        return;
+      }
+      var pageInfo;
+      var postcards;
+      if (feedMode === "community") {
+        // Level 2: postcards inside one species collection.
+        postcards = collectPostcardsFromCollectionMedia(data);
+        var col = data.data && data.data.collection;
+        pageInfo = col && col.media && col.media.pageInfo;
+      } else {
+        postcards = collectPostcardsFromFeed(data);
+        var feed = data.data && data.data.me && data.data.me.feed;
+        pageInfo = feed && feed.pageInfo;
+      }
       hasMore = !!(pageInfo && pageInfo.hasNextPage && pageInfo.endCursor);
       loadMoreCursor = pageInfo && pageInfo.endCursor ? pageInfo.endCursor : null;
 
@@ -4400,6 +5421,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     function doFetch(token) {
       return fetchMe(token).then(function (meData) {
         applyCameraInventoryFromMeData(meData);
+        if (isCommunitySpecies) return fetchMeCollections(token);
+        if (feedMode === "community") return fetchCollectionMedia(token, communityCollectionId, loadMoreCursor);
         return fetchInboxFeedWithSpeciesFallback(token, loadMoreCursor, true);
       }).then(function (data) {
         applyFeedResponse(data);
@@ -4581,6 +5604,91 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       });
   }
 
+  // Identify Visitor ("WHO DAT?!?"): re-run BirdBuddy inference on the postcard and
+  // reflect any newly identified species in the feed — same as the native app.
+  function extractSpeciesFromReanalyze(data) {
+    var root = data && data.data && data.data.inferenceExternalPostcardReanalyze;
+    var updated = root && root.updatedFeedItem;
+    if (!updated) return null;
+    var names = extractSpeciesNames(updated);
+    var known = names.filter(function (n) { return !isUnknownSpeciesLabel(n); });
+    return { names: names, known: known };
+  }
+
+  function onIdentifyVisitor(postcard, button) {
+    if (!postcard || !postcard.id || busy) return;
+    var feedItemId = String(postcard.id);
+    var original = button ? button.textContent : "";
+    if (button) { button.disabled = true; button.textContent = "Identifying…"; button.classList.add("uploading"); }
+    setHeaderStatus("WHO DAT?!? Asking BirdBuddy to identify the visitor…", false, { persist: true });
+
+    function finish(msg, isErr) {
+      if (button) { button.disabled = false; button.textContent = original || "WHO DAT?!?"; button.classList.remove("uploading"); }
+      setHeaderStatus(msg, !!isErr);
+    }
+
+    function runReanalyze(bbToken) {
+      return bbGraphql({
+        operationName: "inferenceExternalPostcardReanalyze",
+        variables: { feedItemId: feedItemId },
+        query: INFERENCE_REANALYZE_MUTATION
+      }, bbToken).then(function (r) {
+        return r.json().then(function (data) {
+          if (data && data.errors && data.errors.length) {
+            var err = data.errors[0];
+            var e = new Error(err.message || "Identify failed.");
+            e.isAuthError = isBirdBuddyAuthError(err.extensions && err.extensions.code, err.message || "");
+            throw e;
+          }
+          return data;
+        });
+      });
+    }
+
+    getValidBbToken()
+      .then(runReanalyze)
+      .catch(function (e) {
+        if (e && e.isAuthError) { clearBirdBuddyTokens(); return getValidBbToken().then(runReanalyze); }
+        throw e;
+      })
+      .then(function (data) {
+        var res = extractSpeciesFromReanalyze(data);
+        if (res && res.known.length) {
+          postcard.species = res.known;
+          var joined = res.known.join(", ");
+          // Patch the rendered card in place: label, filter attribute, drop button.
+          try {
+            var group = null;
+            var groups = mediaGrid ? mediaGrid.querySelectorAll('.postcard-group') : [];
+            for (var gi = 0; gi < groups.length; gi++) {
+              if ((groups[gi].getAttribute("data-postcard-id") || "") === feedItemId) { group = groups[gi]; break; }
+            }
+            if (group) {
+              group.setAttribute("data-species", joined);
+              var sv = group.querySelector(".species-meta-value");
+              if (sv) sv.textContent = joined;
+              var wb = group.querySelector('[data-whodat-button="true"]');
+              if (wb) wb.parentNode && wb.parentNode.removeChild(wb);
+            }
+          } catch (_) {}
+          applySpeciesFilter(); // refresh species-filter chips/visibility
+          finish("WHO DAT?!? It’s " + joined + "!", false);
+        } else {
+          finish("Still a mystery visitor — BirdBuddy couldn’t identify it. Try again later.", false);
+        }
+      })
+      .catch(function (e) {
+        var raw = (e && e.message) ? String(e.message) : "";
+        // BirdBuddy returns a generic internal/unavailable error when a postcard
+        // can't be reanalyzed (already identified, too old, or not eligible).
+        if (!raw || /internal|unavailable|not available|reanalyz|INFERENCE/i.test(raw)) {
+          finish("BirdBuddy couldn’t re-identify this visitor right now (it may already be identified or too old).", false);
+        } else {
+          finish(raw, true);
+        }
+      });
+  }
+
   function onSaveToCollection(postcard, button) {
     if (!postcard || !postcard.id) return;
     var saveButton = button || findCollectionSaveButton(postcard.id);
@@ -4728,18 +5836,73 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     });
   }
 
+  // Harvest EVERY bird metadata field we can from a postcard/community postcard +
+  // its media, for embedding into Frame.io (as the asset comment + flat fields).
+  function buildFrameioMetadata(postcard, media) {
+    var lines = [];
+    var fields = {};
+    function add(label, val) {
+      if (val === null || val === undefined) return;
+      val = String(val).trim();
+      if (!val || val === "—") return;
+      lines.push(label + ": " + val);
+      fields[label] = val;
+    }
+    var det = Array.isArray(postcard.speciesDetailed) ? postcard.speciesDetailed : [];
+    var common = det.map(function (d) { return d.name; }).filter(Boolean);
+    var sci = det.map(function (d) { return d.scientificName; }).filter(Boolean);
+    var ids = det.map(function (d) { return d.id; }).filter(Boolean);
+    var known = getCanonicalSpeciesList(postcard).filter(function (n) { return !isUnknownSpeciesLabel(n); });
+    add("Species", (common.length ? common : known).join(", ") || (postcard.isMysteryVisitor ? "Mystery visitor" : ""));
+    add("Scientific name", sci.join(", "));
+    add("Species ID", ids.join(", "));
+    if (postcard.feeder) {
+      add("Feeder", postcard.feeder.name);
+      add("Feeder type", postcard.feeder.housingType);
+      add("Feeder model", postcard.feeder.version);
+      add("Location", [postcard.feeder.city, postcard.feeder.country].filter(Boolean).join(", "));
+    }
+    add("Owner", postcard.ownerName);
+    if (postcard.createdAt) {
+      var d = new Date(postcard.createdAt);
+      add("Captured", isNaN(d.getTime()) ? postcard.createdAt : d.toISOString());
+    }
+    add("Media type", media && media.isVideo ? "Video (MP4)" : "Photo (JPG)");
+    if (media && (media.width || media.height)) add("Dimensions", (media.width || "?") + " × " + (media.height || "?"));
+    add("Quality", media && media.quality);
+    add("Origin", postcard.origin);
+    if (typeof postcard.likes === "number") add("Likes", postcard.likes);
+    if (postcard.isShared) add("Shared to community", "yes");
+    if (postcard.isMysteryVisitor) add("Mystery visitor", "yes");
+    add("Feed type", formatItemType(postcard.itemType));
+    add("BirdBuddy postcard ID", postcard.id);
+    if (media && media.id) add("BirdBuddy media ID", media.id);
+    add("Source", "BirdBuddy via GetBirds (hh5hh.com)");
+    var description = "🐦 BirdBuddy capture\n" + lines.join("\n");
+    return { description: description, fields: fields };
+  }
+
+  function frameioSendBody(postcard, media, extra) {
+    var meta = buildFrameioMetadata(postcard, media);
+    var body = {
+      mediaUrl: media.url,
+      filename: filenameFromMedia(media),
+      createdAt: postcard.createdAt || "",
+      species: formatSpeciesLabel(postcard),
+      postcardId: postcard.id || "",
+      description: meta.description,
+      metadata: meta.fields
+    };
+    if (extra) { for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) body[k] = extra[k]; } }
+    return body;
+  }
+
   function sendToFrameio(postcard, media) {
     return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-send", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({
-        mediaUrl: media.url,
-        filename: filenameFromMedia(media),
-        createdAt: postcard.createdAt || "",
-        species: formatSpeciesLabel(postcard),
-        postcardId: postcard.id || ""
-      })
+      body: JSON.stringify(frameioSendBody(postcard, media))
     }).then(function (r) {
       return r.json().catch(function(){ return {}; }).then(function (data) {
         if (r.status === 401 && data.needsAuth) {
@@ -4787,6 +5950,16 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
   function onFrameioSendSuccess(result, button, mediaKey) {
     setFrameioAuthed(true); // a successful send proves the server session is live
+    // Surface status diagnostics so we can see exactly what the Status PATCH did.
+    try {
+      if (result && result.statusDebug) {
+        console[(result.statusSet ? "log" : "warn")]("Frame.io Status →", result.statusSet ? "set to Needs Review" : "NOT set", result.statusDebug);
+      }
+      if (result && result.customFieldsDebug) {
+        var fieldsOk = result.customFieldsSet && result.customFieldsSet.length;
+        console[(fieldsOk ? "log" : "warn")]("Frame.io custom fields →", fieldsOk ? result.customFieldsSet : "NOT set", result.customFieldsDebug);
+      }
+    } catch (_) {}
     setSendToAdobeButton(button, "sent", "Sent to Adobe ✓");
     // Record the media as pushed so it can never be re-uploaded (dedupe), and mark
     // every button for that media across the grid.
@@ -4798,13 +5971,14 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     var dateName = (result && result.dateName) ? (' (' + result.dateName + ')') : "";
     var already = result && (result.duplicate || result.status === "already-sent");
     var verb = already ? "Already in " : "Sent to ";
+    var statusNote = (result && result.statusSet) ? " · Status: Needs Review" : "";
     var preview = openFrameioAssetPreview(result);
     if (preview.opened) {
-      setHeaderStatus(verb + projectName + dateName + " — opened the asset preview in Frame.io.", false);
+      setHeaderStatus(verb + projectName + dateName + statusNote + " — opened the asset preview in Frame.io.", false);
     } else {
       // Post-redirect pop-ups can be blocked; surface the exact asset URL so the
       // uploaded asset is still one click away.
-      setHeaderStatus(verb + projectName + dateName + ". Pop-up blocked — open the asset: " + preview.url, false, { persist: true });
+      setHeaderStatus(verb + projectName + dateName + statusNote + ". Pop-up blocked — open the asset: " + preview.url, false, { persist: true });
     }
   }
 
@@ -4816,14 +5990,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
 
   function frameioAuthPayload(postcard, media) {
-    return JSON.stringify({
-      usage_id: getFrameioUsageId(),
-      mediaUrl: media.url,
-      filename: filenameFromMedia(media),
-      createdAt: postcard.createdAt || "",
-      species: formatSpeciesLabel(postcard),
-      postcardId: postcard.id || ""
-    });
+    return JSON.stringify(frameioSendBody(postcard, media, { usage_id: getFrameioUsageId() }));
   }
 
   // Popup-based Adobe IMS auth — mirrors the smooth "Save to YouTube" (Google
@@ -6404,7 +7571,308 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     getbirdsTvDownload.setAttribute("data-download-name", segment.downloadName || "");
   }
 
+  /* ===================== GO LIVE (BirdBuddy livestream) =====================
+     ⚠️ PLACEHOLDER / REVISIT (2026-09-24): Live playback works in Safari (native
+     HEVC HLS) but NOT desktop Chrome/Firefox — BirdBuddy streams HEVC/H.265,
+     which those browsers can't decode, and only a server-side transcoder
+     (go2rtc/ffmpeg — not available on shared hosting) would fix it. The CORS
+     proxy (api=hls-proxy) is in place. TODO: revisit — either gate GO LIVE to
+     Safari-capable clients, stand up a transcoder on a VPS, or embed BirdBuddy's
+     own player. Leaving the flow implemented but flagged for re-implementation.
+
+     Mirrors GetBirds.TV: reuses the same fullscreen overlay + <video>, but plays
+     the BirdBuddy live camera feed instead of postcard MP4s. Flow (from the
+     BirdBuddy app): watchingStart (watchingStartV2) → poll watchingStartCheck
+     until a WatchingActiveResult with a streamUrl, or a WatchingFailedResult
+     (feeder DEEP_SLEEP/offline) → "asleep right now" failover. */
+  var WATCHING_FRAGMENTS = [
+    "fragment WatchingActiveResultFields on WatchingActiveResult { watching { streamUrl ...WatchingFields __typename } __typename }",
+    "fragment WatchingFields on Watching { id state feeder { ...FeederFields __typename } webRtcConfig { ...WatchingWebRtcConfigFields __typename } __typename }",
+    "fragment FeederFields on Feeder { id name state version ... on FeederForPrivate { supportsWebRTC supportsLivestreamSnapshot __typename } __typename }",
+    "fragment WatchingWebRtcConfigFields on WatchingWebRtcConfigResult { wssUrl iceServers { urls username credential __typename } __typename }",
+    "fragment WatchingFailedResultFields on WatchingFailedResult { failedReason watching { ...WatchingFields __typename } __typename }",
+    "fragment WatchingStartInProgressResultFields on WatchingStartInProgressResult { watching { streamUrl ...WatchingFields __typename } __typename }"
+  ].join(" ");
+  var WATCHING_START_QUERY =
+    "mutation watchingStart($startWatchingInput: StartWatchingInput!) { watchingStartV2(startWatchingInput: $startWatchingInput) { " +
+    "... on WatchingActiveResult { ...WatchingActiveResultFields __typename } " +
+    "... on WatchingFailedResult { ...WatchingFailedResultFields __typename } " +
+    "... on WatchingStartInProgressResult { ...WatchingStartInProgressResultFields __typename } __typename } } " + WATCHING_FRAGMENTS;
+  var WATCHING_START_CHECK_QUERY =
+    "mutation watchingStartCheck($startWatchingInput: StartWatchingInput!) { watchingStartCheck(startWatchingInput: $startWatchingInput) { " +
+    "... on WatchingActiveResult { ...WatchingActiveResultFields __typename } " +
+    "... on WatchingFailedResult { ...WatchingFailedResultFields __typename } " +
+    "... on WatchingStartInProgressResult { ...WatchingStartInProgressResultFields __typename } __typename } } " + WATCHING_FRAGMENTS;
+
+  var LIVE_POLL_INTERVAL_MS = 2500;
+  var LIVE_MAX_WAIT_MS = 75000;
+  var getbirdsLiveActive = false;
+  var getbirdsLivePollTimer = null;
+  var getbirdsLiveCancelled = false;
+
+  var ASLEEP_REASONS = { DEEP_SLEEP: 1, ASLEEP: 1, SLEEP: 1, OFFLINE: 1, FEEDER_OFFLINE: 1, POWER_SAVE: 1, POWER_SAVING: 1, HIBERNATE: 1 };
+  function liveReasonIsAsleep(reason) {
+    return !!ASLEEP_REASONS[String(reason || "").toUpperCase()];
+  }
+
+  // Pick the BirdBuddy feeder to go live on: the currently selected camera when a
+  // specific one is chosen, otherwise the first known feeder.
+  function pickLiveCamera() {
+    var list = Array.isArray(allCameras) ? allCameras : [];
+    if (!list.length) return null;
+    if (cameraFilter && cameraFilter !== "All") {
+      for (var i = 0; i < list.length; i++) { if (list[i] && list[i].id === cameraFilter) return list[i]; }
+    }
+    // Prefer an awake feeder if one is obviously awake; else just take the first.
+    for (var j = 0; j < list.length; j++) {
+      var st = String((list[j] && list[j].state) || "").toUpperCase();
+      if (st && !liveReasonIsAsleep(st)) return list[j];
+    }
+    return list[0];
+  }
+
+  function liveWatchMutation(op, feederId, token) {
+    var query = op === "watchingStart" ? WATCHING_START_QUERY : WATCHING_START_CHECK_QUERY;
+    return bbGraphql({ operationName: op, variables: { startWatchingInput: { feederId: feederId } }, query: query }, token)
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data && data.errors && data.errors.length) {
+          var err = data.errors[0] || {};
+          var e = new Error(err.message || "Live request failed.");
+          e.isAuthError = isBirdBuddyAuthError(err.extensions && err.extensions.code, err.message || "");
+          throw e;
+        }
+        var d = data && data.data ? data.data : {};
+        return op === "watchingStart" ? d.watchingStartV2 : d.watchingStartCheck;
+      });
+  }
+
+  // Classify a watching result into: ready (streamUrl), asleep, inprogress, failed.
+  function classifyWatchingResult(res) {
+    if (!res || typeof res !== "object") return { kind: "inprogress" };
+    var tn = res.__typename || "";
+    var watching = res.watching || {};
+    var feederState = String((watching.feeder && watching.feeder.state) || "").toUpperCase();
+    if (tn === "WatchingActiveResult" && watching.streamUrl) {
+      return { kind: "ready", watching: watching };
+    }
+    if (tn === "WatchingFailedResult") {
+      if (liveReasonIsAsleep(res.failedReason) || liveReasonIsAsleep(feederState)) return { kind: "asleep" };
+      return { kind: "failed", reason: res.failedReason || "" };
+    }
+    if (liveReasonIsAsleep(feederState)) return { kind: "asleep" };
+    // In progress (waking) or active-but-no-url-yet.
+    return { kind: "inprogress", watching: watching };
+  }
+
+  function pollLiveUntilReady(feederId, token, startedAt) {
+    return new Promise(function (resolve, reject) {
+      function step() {
+        if (getbirdsLiveCancelled) { reject(new Error("cancelled")); return; }
+        if (Date.now() - startedAt > LIVE_MAX_WAIT_MS) { var t = new Error("timeout"); t.isTimeout = true; reject(t); return; }
+        liveWatchMutation("watchingStartCheck", feederId, token).then(function (res) {
+          if (getbirdsLiveCancelled) { reject(new Error("cancelled")); return; }
+          var c = classifyWatchingResult(res);
+          if (c.kind === "ready") { resolve(c.watching); return; }
+          if (c.kind === "asleep") { var a = new Error("asleep"); a.isAsleep = true; reject(a); return; }
+          if (c.kind === "failed") { reject(new Error(c.reason || "Live stream failed.")); return; }
+          getbirdsLivePollTimer = setTimeout(step, LIVE_POLL_INTERVAL_MS);
+        }).catch(reject);
+      }
+      getbirdsLivePollTimer = setTimeout(step, LIVE_POLL_INTERVAL_MS);
+    });
+  }
+
+  function showLiveMessage(emoji, title, sub) {
+    if (!getbirdsTvLiveMsg) return;
+    getbirdsTvLiveMsg.innerHTML = "";
+    if (emoji) { var e = document.createElement("div"); e.className = "livemsg-emoji"; e.textContent = emoji; getbirdsTvLiveMsg.appendChild(e); }
+    var t = document.createElement("div"); t.className = "livemsg-title"; t.textContent = title || ""; getbirdsTvLiveMsg.appendChild(t);
+    if (sub) { var s = document.createElement("div"); s.className = "livemsg-sub"; s.textContent = sub; getbirdsTvLiveMsg.appendChild(s); }
+    getbirdsTvLiveMsg.classList.remove("hidden");
+  }
+  function hideLiveMessage() { if (getbirdsTvLiveMsg) getbirdsTvLiveMsg.classList.add("hidden"); }
+
+  function loadHlsJs() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (window.__gbHlsLoading) return window.__gbHlsLoading;
+    window.__gbHlsLoading = new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js";
+      s.async = true;
+      s.onload = function () { resolve(window.Hls); };
+      s.onerror = function () { reject(new Error("Could not load HLS player.")); };
+      document.head.appendChild(s);
+    });
+    return window.__gbHlsLoading;
+  }
+
+  function isSafariBrowser() {
+    var ua = navigator.userAgent || "";
+    var isSafari = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(ua);
+    // iOS browsers all use WebKit and can play HEVC HLS natively too.
+    var isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    return isSafari || isIOS;
+  }
+  function browserCanDecodeHevc() {
+    try {
+      var v = document.createElement("video");
+      // hvc1/hev1 probe — Safari returns "probably"/"maybe"; Chrome usually "".
+      return !!(v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
+                v.canPlayType('application/vnd.apple.mpegurl'));
+    } catch (_) { return false; }
+  }
+
+  function playLiveStream(url) {
+    var v = getbirdsTvVideo;
+    if (!v || !url) return;
+    hideLiveMessage();
+    if (getbirdsTvImage) getbirdsTvImage.classList.add("hidden");
+    v.classList.remove("hidden");
+    v.muted = false;
+    v.loop = false;
+    v.onended = null;
+
+    var proxied = HLS_PROXY + encodeURIComponent(url);
+
+    function showHevcHelp() {
+      // Proxy defeats CORS, but BirdBuddy streams HEVC/H.265 which desktop Chrome
+      // can't decode. Be honest and point the user to Safari.
+      showLiveMessage("🧭", "Live view needs Safari",
+        "The camera is awake, but BirdBuddy streams in HEVC/H.265 — Safari can play it, most other desktop browsers can’t. Open GetBirds in Safari to watch live.");
+      if (getbirdsTvLiveBadge) getbirdsTvLiveBadge.classList.add("hidden");
+      if (v) { try { v.classList.add("hidden"); } catch (_) {} }
+    }
+
+    function nativePlay(src) { try { v.src = src; v.play().catch(function () {}); } catch (_) {} }
+
+    function attachHls(Hls) {
+      try {
+        if (window.__gbHls) { try { window.__gbHls.destroy(); } catch (_) {} window.__gbHls = null; }
+        var hls = new Hls({ lowLatencyMode: true, xhrSetup: function () {} });
+        window.__gbHls = hls;
+        // Load THROUGH the same-origin proxy so segment fetches aren't CORS-blocked.
+        hls.loadSource(proxied);
+        hls.attachMedia(v);
+        hls.on(Hls.Events.MANIFEST_PARSED, function () { v.play().catch(function () {}); });
+        hls.on(Hls.Events.ERROR, function (evt, data) {
+          if (!data || !data.fatal) return;
+          try { hls.destroy(); } catch (_) {} window.__gbHls = null;
+          // A fatal media error on non-Safari almost always means the HEVC codec.
+          showHevcHelp();
+        });
+      } catch (_) { showHevcHelp(); }
+    }
+
+    if (isSafariBrowser() && v.canPlayType("application/vnd.apple.mpegurl")) {
+      // Safari: native HLS bypasses CORS and hardware-decodes HEVC — play direct.
+      nativePlay(url);
+      if (getbirdsTvLiveBadge) getbirdsTvLiveBadge.classList.remove("hidden");
+      updateGetBirdsTvUnmuteButton();
+      return;
+    }
+
+    if (!browserCanDecodeHevc()) {
+      // Non-Safari desktop: proxy would fix CORS but the browser can't decode HEVC.
+      showHevcHelp();
+      return;
+    }
+
+    // HEVC-capable non-Safari (rare): try hls.js through the proxy, else native.
+    if (window.Hls && window.Hls.isSupported()) { attachHls(window.Hls); }
+    else { loadHlsJs().then(function (Hls) { if (Hls && Hls.isSupported()) attachHls(Hls); else nativePlay(proxied); }).catch(function () { nativePlay(proxied); }); }
+    if (getbirdsTvLiveBadge) getbirdsTvLiveBadge.classList.remove("hidden");
+    updateGetBirdsTvUnmuteButton();
+  }
+
+  function prepareLiveOverlay() {
+    if (!getbirdsTvOverlay) return;
+    getbirdsLiveActive = true;
+    getbirdsLiveCancelled = false;
+    getbirdsTvSegments = [];
+    getbirdsTvOverlay.classList.remove("hidden");
+    getbirdsTvOverlay.classList.add("is-live");
+    // Live has no prev/next or download.
+    if (getbirdsTvPrevPanel) getbirdsTvPrevPanel.style.display = "none";
+    if (getbirdsTvNextPanel) getbirdsTvNextPanel.style.display = "none";
+    if (getbirdsTvDownload) getbirdsTvDownload.style.display = "none";
+    if (getbirdsTvVideo) { getbirdsTvVideo.onended = null; getbirdsTvVideo.classList.add("hidden"); }
+    if (getbirdsTvImage) getbirdsTvImage.classList.add("hidden");
+    if (getbirdsTvLiveBadge) getbirdsTvLiveBadge.classList.add("hidden");
+    if (!getbirdsTvEscapeHandler) {
+      getbirdsTvEscapeHandler = function (e) {
+        if (e.key !== "Escape") return;
+        if (!getbirdsTvOverlay || getbirdsTvOverlay.classList.contains("hidden")) return;
+        closeGetBirdsTV();
+      };
+      document.addEventListener("keydown", getbirdsTvEscapeHandler);
+    }
+  }
+
+  function setLiveButtonBusy(on) {
+    if (!getbirdsLiveBtn) return;
+    getbirdsLiveBtn.classList.toggle("busy", !!on);
+    getbirdsLiveBtn.disabled = !!on;
+  }
+
+  function openGetBirdsLive() {
+    if (getbirdsLiveActive) return;
+    var cam = pickLiveCamera();
+    if (!cam || !cam.id) {
+      setHeaderStatus("No BirdBuddy camera is available to go live. Sign in and load your feeders first.", true);
+      return;
+    }
+    setLiveButtonBusy(true);
+    prepareLiveOverlay();
+    var camName = cam.name || "BirdBuddy";
+    showLiveMessage("📡", "Connecting to " + camName + "…", "Waking the camera and starting the live feed.");
+
+    getValidBbToken().then(function (token) {
+      return liveWatchMutation("watchingStart", cam.id, token).then(function (res) {
+        if (getbirdsLiveCancelled) throw new Error("cancelled");
+        var c = classifyWatchingResult(res);
+        if (c.kind === "ready") return c.watching;
+        if (c.kind === "asleep") { var a = new Error("asleep"); a.isAsleep = true; throw a; }
+        if (c.kind === "failed") throw new Error(c.reason || "Live stream failed.");
+        showLiveMessage("📡", camName + " is waking up…", "This can take up to a minute for a sleeping camera.");
+        return pollLiveUntilReady(cam.id, token, Date.now());
+      });
+    }).then(function (watching) {
+      if (getbirdsLiveCancelled) return;
+      if (watching && watching.streamUrl) {
+        playLiveStream(watching.streamUrl);
+        setHeaderStatus("Opened live view for " + camName + ".", false);
+      } else {
+        showLiveMessage("😴", camName + " is asleep right now", "The live camera isn't streaming. Try again later.");
+      }
+    }).catch(function (err) {
+      if (err && err.message === "cancelled") return;
+      if (err && (err.isAsleep || err.isTimeout)) {
+        showLiveMessage("😴", camName + " is asleep right now", "The BirdBuddy camera isn't awake to stream. Try again later.");
+      } else if (err && err.isAuthError) {
+        showLiveMessage("🔒", "Sign-in needed", "Your BirdBuddy session expired. Close this, sign in again, then GO LIVE.");
+      } else {
+        showLiveMessage("⚠️", "Live stream unavailable", (err && err.message) || "Could not start the live feed.");
+      }
+    }).finally(function () {
+      setLiveButtonBusy(false);
+    });
+  }
+
+  function stopLiveWatch() {
+    getbirdsLiveCancelled = true;
+    if (getbirdsLivePollTimer) { clearTimeout(getbirdsLivePollTimer); getbirdsLivePollTimer = null; }
+    if (window.__gbHls) { try { window.__gbHls.destroy(); } catch (_) {} window.__gbHls = null; }
+    getbirdsLiveActive = false;
+    hideLiveMessage();
+    if (getbirdsTvLiveBadge) getbirdsTvLiveBadge.classList.add("hidden");
+    if (getbirdsTvOverlay) getbirdsTvOverlay.classList.remove("is-live");
+    if (getbirdsTvPrevPanel) getbirdsTvPrevPanel.style.display = "";
+    if (getbirdsTvNextPanel) getbirdsTvNextPanel.style.display = "";
+  }
+
   function closeGetBirdsTV() {
+    if (getbirdsLiveActive) stopLiveWatch();
     if (getbirdsTvKeyHandler) {
       document.removeEventListener("keydown", getbirdsTvKeyHandler);
       getbirdsTvKeyHandler = null;
@@ -6557,6 +8025,19 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
   if (getbirdsTvBtn) {
     getbirdsTvBtn.addEventListener("click", function () { openGetBirdsTV(); });
+  }
+  if (getbirdsLiveBtn) {
+    getbirdsLiveBtn.addEventListener("click", function () { openGetBirdsLive(); });
+  }
+  if (avatar) {
+    avatar.style.cursor = "pointer";
+    avatar.setAttribute("role", "button");
+    avatar.setAttribute("tabindex", "0");
+    avatar.title = "Toggle My Media (the postcards you’ve saved)";
+    avatar.addEventListener("click", function () { toggleMyMediaFeed(); });
+    avatar.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleMyMediaFeed(); }
+    });
   }
   if (getbirdsTvClose) {
     getbirdsTvClose.addEventListener("click", closeGetBirdsTV);
