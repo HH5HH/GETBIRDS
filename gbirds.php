@@ -1,5 +1,17 @@
 <?php
 /*
+ * Optional private FireBird configuration.
+ *
+ * For Hostinger, upload firebird-config.php alongside this file (or update the
+ * require path below if you keep it outside public_html). The config file is
+ * intentionally separate from Git so Client Secrets are never committed.
+ */
+$firebirdConfigPath = __DIR__ . '/firebird-config.php';
+if (is_file($firebirdConfigPath)) {
+    require_once $firebirdConfigPath;
+}
+
+/*
  * GetBirds / FireBird server gateway
  * - Serves the existing SPA unchanged when requested normally.
  * - Provides same-origin server-side proxies for BirdBuddy GraphQL and media.
@@ -181,6 +193,1034 @@ function gbirds_proxy_media(): void {
     exit;
 }
 
+
+
+function gbirds_config_value(string $name, string $default = ''): string {
+    if (defined($name)) {
+        $value = constant($name);
+        if ($value !== null && $value !== '') return trim((string)$value);
+    }
+    $env = getenv($name);
+    if ($env !== false && trim((string)$env) !== '') return trim((string)$env);
+    return $default;
+}
+
+function gbirds_frameio_config(): array {
+    // Frame.io V4 Web App User Authentication uses this documented scope set.
+    // Keep this fixed for the Frame.io credential so stale/private config values
+    // cannot introduce unrelated IMS scopes and cause invalid_scope.
+    $frameioScopes = 'openid,email,profile,offline_access,additional_info.roles';
+    return [
+        'client_id' => gbirds_config_value('FIREBIRD_FRAMEIO_CLIENT_ID'),
+        'client_secret' => gbirds_config_value('FIREBIRD_FRAMEIO_CLIENT_SECRET'),
+        'redirect_uri' => gbirds_config_value('FIREBIRD_FRAMEIO_REDIRECT_URI', 'https://hh5hh.com/gbirds.php?api=frameio-callback'),
+        'scopes' => $frameioScopes,
+        'project_id' => gbirds_config_value('FIREBIRD_FRAMEIO_PROJECT_ID', 'f7f67254-9ec8-4e2c-99f8-32cd31123eef'),
+        // Target collection inside the project. Resolved at runtime by id first,
+        // then by name. Static collections expose a root_folder_id we upload into;
+        // date folders are created under it. Leave both empty to upload under the
+        // project root instead.
+        'collection_id' => gbirds_config_value('FIREBIRD_FRAMEIO_COLLECTION_ID', ''),
+        'collection_name' => gbirds_config_value('FIREBIRD_FRAMEIO_COLLECTION_NAME', 'Project_FIREBIRD'),
+        // Explicit base folder to upload into (takes priority over collection).
+        // This is the "BIRDS" folder inside Assets; date subfolders are created
+        // under it. Leave empty to fall back to the collection / project root.
+        'folder_id' => gbirds_config_value('FIREBIRD_FRAMEIO_FOLDER_ID', 'a80bef5f-0ec5-4074-b68e-6e70c5f1670f'),
+        'api_base' => 'https://api.frame.io/v4',
+        'ims_base' => 'https://ims-na1.adobelogin.com',
+    ];
+}
+
+// Bump this whenever gbirds.php is redeployed so ?api=frameio-status confirms the
+// LIVE server is running the intended build (guards against stale uploads).
+if (!defined('FIREBIRD_BUILD_VERSION')) {
+    define('FIREBIRD_BUILD_VERSION', 'firebird-2026-09-24-onelogin-dedupe-5');
+}
+
+function gbirds_session_start(): void {
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_name('FIREBIRDSESSID');
+        $secure = (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off')
+            || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+        session_set_cookie_params([
+            'lifetime' => 0,
+            'path' => '/',
+            'secure' => $secure,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+        session_start();
+    }
+}
+
+function gbirds_frameio_http(string $method, string $url, ?array $body, string $accessToken, array $extraHeaders = []): array {
+    gbirds_require_curl();
+    $headers = [
+        'Authorization: Bearer ' . $accessToken,
+        'Accept: application/json',
+    ];
+    if ($body !== null) {
+        $headers[] = 'Content-Type: application/json';
+    }
+    foreach ($extraHeaders as $h) { $headers[] = $h; }
+    $ch = curl_init($url);
+    $opts = [
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => $headers,
+    ];
+    if ($body !== null) { $opts[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_SLASHES); }
+    curl_setopt_array($ch, $opts);
+    $raw = curl_exec($ch);
+    if ($raw === false) { $err = curl_error($ch); curl_close($ch); throw new RuntimeException('Frame.io request failed: ' . $err); }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $responseBody = substr($raw, $headerSize);
+    curl_close($ch);
+    $decoded = json_decode($responseBody, true);
+    if (!is_array($decoded)) {
+        $decoded = ['raw' => trim(substr($responseBody, 0, 2000))];
+    } else {
+        $decoded['_http_status'] = $status;
+        if (isset($responseBody[0]) && !isset($decoded['_raw'])) {
+            $decoded['_raw'] = trim(substr($responseBody, 0, 2000));
+        }
+    }
+    return [$status, $decoded];
+}
+
+function gbirds_frameio_token_is_fresh(): bool {
+    gbirds_session_start();
+    $exp = (int)($_SESSION['frameio_expires_at'] ?? 0);
+    return !empty($_SESSION['frameio_access_token']) && $exp > (time() + 60);
+}
+
+function gbirds_frameio_begin_usage(): void {
+    gbirds_session_start();
+    $usageId = trim((string)($_GET['usage_id'] ?? $_POST['usage_id'] ?? ''));
+    if ($usageId === '' || !preg_match('/^[A-Za-z0-9_-]{16,128}$/', $usageId)) {
+        gbirds_json_response(['ok'=>false,'error'=>'Invalid FireBird usage ID.'],400);
+    }
+    $current = (string)($_SESSION['frameio_usage_id'] ?? '');
+    if ($current !== $usageId) {
+        unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_oauth_state'], $_SESSION['frameio_pending_upload'], $_SESSION['frameio_usage_authenticated'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_auth_error'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_date_collections']);
+        $_SESSION['frameio_usage_id'] = $usageId;
+        $_SESSION['frameio_usage_authenticated'] = false;
+    }
+    gbirds_json_response([
+        'ok' => true,
+        'usageId' => $usageId,
+        'authenticated' => !empty($_SESSION['frameio_usage_authenticated']) && gbirds_frameio_token_is_fresh()
+    ]);
+}
+
+function gbirds_frameio_begin_auth(): void {
+    gbirds_session_start();
+    $input = json_decode((string)file_get_contents('php://input'), true);
+    if (!is_array($input)) $input = $_POST;
+    if (!is_array($input)) $input = [];
+
+    $usageId = trim((string)($input['usage_id'] ?? ''));
+    if ($usageId === '' || !preg_match('/^[A-Za-z0-9_-]{16,128}$/', $usageId)) {
+        gbirds_json_response(['ok'=>false,'error'=>'Invalid FireBird usage ID.'],400);
+    }
+
+    $mediaUrl = trim((string)($input['mediaUrl'] ?? ''));
+    $filename = trim((string)($input['filename'] ?? ''));
+    $createdAt = trim((string)($input['createdAt'] ?? ''));
+    $species = trim((string)($input['species'] ?? ''));
+    $postcardId = trim((string)($input['postcardId'] ?? ''));
+    if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
+        gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
+    }
+    if ($filename === '') {
+        $filename = 'file_' . md5($mediaUrl) . (preg_match('/\.mp4(?:$|[?#])/i',$mediaUrl) ? '.mp4' : '.jpg');
+    }
+
+    // Explicit first-click gate: discard any previously cached Frame.io/IMS token
+    // so Send to Adobe can never silently reuse an old account/profile.
+    unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_account_id'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_auth_error']);
+    $_SESSION['frameio_usage_id'] = $usageId;
+    $_SESSION['frameio_usage_authenticated'] = false;
+    $_SESSION['frameio_pending_upload'] = [
+        'mediaUrl'=>$mediaUrl,
+        'filename'=>$filename,
+        'createdAt'=>$createdAt,
+        'species'=>$species,
+        'postcardId'=>$postcardId
+    ];
+
+    try {
+        $authorizeUrl = gbirds_frameio_authorize_url();
+    } catch (Throwable $e) {
+        gbirds_json_response(['ok'=>false,'error'=>$e->getMessage(),'stage'=>'frameio-auth-begin'],500);
+    }
+
+    gbirds_json_response(['ok'=>true,'needsAuth'=>true,'authorizeUrl'=>$authorizeUrl]);
+}
+
+function gbirds_frameio_authorize_url(): string {
+    $cfg = gbirds_frameio_config();
+    if ($cfg['client_id'] === '') throw new RuntimeException('Frame.io Client ID is not configured on the server.');
+    gbirds_session_start();
+    $state = bin2hex(random_bytes(24));
+    $_SESSION['frameio_oauth_state'] = $state;
+    $scope = preg_replace('/\s*,\s*/', ',', preg_replace('/\s+/', ',', trim($cfg['scopes'])));
+    $nonce = bin2hex(random_bytes(24));
+    $_SESSION['frameio_auth_started_at'] = time();
+    $_SESSION['frameio_auth_nonce'] = $nonce;
+    // prompt=login forces a fresh sign-in (ignores any pre-existing IMS session);
+    // select_account additionally forces Adobe's account/profile chooser so users
+    // who belong to multiple IMS orgs must pick the profile/org that actually has
+    // access to Project_FIREBIRD instead of silently landing on their default org.
+    $query = http_build_query([
+        'client_id' => $cfg['client_id'],
+        'redirect_uri' => $cfg['redirect_uri'],
+        'scope' => $scope,
+        'response_type' => 'code',
+        'response_mode' => 'query',
+        'state' => $state,
+        'nonce' => $nonce,
+        'prompt' => 'login select_account',
+    ], '', '&', PHP_QUERY_RFC3986);
+    return $cfg['ims_base'] . '/ims/authorize/v2?' . $query;
+}
+
+function gbirds_frameio_exchange_code(string $code): array {
+    $cfg = gbirds_frameio_config();
+    if ($cfg['client_id'] === '' || $cfg['client_secret'] === '') throw new RuntimeException('Frame.io OAuth credentials are not configured on the server.');
+    gbirds_require_curl();
+    $ch = curl_init($cfg['ims_base'] . '/ims/token/v3');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 45,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/x-www-form-urlencoded',
+            'Accept: application/json',
+            'Authorization: Basic ' . base64_encode($cfg['client_id'] . ':' . $cfg['client_secret']),
+        ],
+        CURLOPT_POSTFIELDS => http_build_query([
+            'grant_type' => 'authorization_code',
+            'code' => $code,
+            'redirect_uri' => $cfg['redirect_uri'],
+        ]),
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) { $err = curl_error($ch); curl_close($ch); throw new RuntimeException('Adobe IMS token exchange failed: ' . $err); }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $data = json_decode($raw, true);
+    if (!is_array($data)) $data = [];
+    if ($status < 200 || $status >= 300 || empty($data['access_token'])) {
+        $msg = $data['error_description'] ?? $data['error'] ?? ('IMS token exchange failed (' . $status . ')');
+        throw new RuntimeException($msg);
+    }
+    return $data;
+}
+
+function gbirds_frameio_capture_ims_context(array $tokens): void {
+    gbirds_session_start();
+    unset($_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id']);
+    $idToken = (string)($tokens['id_token'] ?? '');
+    if ($idToken === '') return;
+    $parts = explode('.', $idToken);
+    if (count($parts) < 2) return;
+    $payload = json_decode(base64_decode(strtr($parts[1], '-_', '+/')), true);
+    if (!is_array($payload)) return;
+    foreach (['org_id', 'orgId', 'imsOrgId', 'ims_org_id'] as $key) {
+        if (!empty($payload[$key])) {
+            $_SESSION['frameio_ims_org_id'] = trim((string)$payload[$key]);
+            break;
+        }
+    }
+    if (!empty($payload['sub'])) {
+        $_SESSION['frameio_ims_user_id'] = trim((string)$payload['sub']);
+    }
+}
+
+function gbirds_frameio_store_tokens(array $tokens): void {
+    gbirds_session_start();
+    $_SESSION['frameio_access_token'] = (string)$tokens['access_token'];
+    $_SESSION['frameio_refresh_token'] = (string)($tokens['refresh_token'] ?? ($_SESSION['frameio_refresh_token'] ?? ''));
+    $_SESSION['frameio_expires_at'] = time() + max(60, ((int)($tokens['expires_in'] ?? 3600)) - 60);
+}
+
+function gbirds_frameio_refresh(): bool {
+    gbirds_session_start();
+    $refresh = trim((string)($_SESSION['frameio_refresh_token'] ?? ''));
+    $cfg = gbirds_frameio_config();
+    if ($refresh === '' || $cfg['client_id'] === '' || $cfg['client_secret'] === '') return false;
+    gbirds_require_curl();
+    $ch = curl_init($cfg['ims_base'] . '/ims/token/v3');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 15, CURLOPT_TIMEOUT => 45,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/x-www-form-urlencoded',
+            'Accept: application/json',
+            'Authorization: Basic ' . base64_encode($cfg['client_id'] . ':' . $cfg['client_secret']),
+        ],
+        CURLOPT_POSTFIELDS => http_build_query([
+            'grant_type' => 'refresh_token',
+            'refresh_token' => $refresh,
+        ]),
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) { curl_close($ch); return false; }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    $data = json_decode($raw, true);
+    if ($status < 200 || $status >= 300 || !is_array($data) || empty($data['access_token'])) return false;
+    gbirds_frameio_store_tokens($data);
+    return true;
+}
+
+function gbirds_frameio_access_token(): string {
+    gbirds_session_start();
+    // A Frame.io token is usable only after THIS browser-tab usage completed the
+    // Adobe IMS Web App flow. Prior/stale sessions are never accepted as an
+    // implicit login for the first Send to Adobe in a usage.
+    if (empty($_SESSION['frameio_usage_authenticated'])) {
+        throw new RuntimeException('Adobe IMS authorization is required.');
+    }
+    if (gbirds_frameio_token_is_fresh()) return (string)$_SESSION['frameio_access_token'];
+    if (gbirds_frameio_refresh()) return (string)$_SESSION['frameio_access_token'];
+    $_SESSION['frameio_usage_authenticated'] = false;
+    throw new RuntimeException('Adobe IMS authorization is required.');
+}
+
+function gbirds_frameio_clear_session(): void {
+    gbirds_session_start();
+    unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_oauth_state'], $_SESSION['frameio_pending_upload'], $_SESSION['frameio_usage_authenticated'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_auth_error'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_date_collections']);
+}
+
+
+function gbirds_frameio_get_me(string $accessToken): array {
+    $cfg = gbirds_frameio_config();
+    [$status, $data] = gbirds_frameio_http('GET', $cfg['api_base'] . '/me', null, $accessToken);
+    if ($status < 200 || $status >= 300) {
+        $detail = $data['message'] ?? ($data['error']['message'] ?? '');
+        throw new RuntimeException('Frame.io identity check failed (' . $status . ')' . ($detail ? ': ' . $detail : '.'));
+    }
+    return is_array($data) ? $data : [];
+}
+
+function gbirds_frameio_project_user_role(string $accessToken, string $accountId, string $projectId, string $userId): string {
+    $cfg = gbirds_frameio_config();
+    [$status, $data] = gbirds_frameio_http(
+        'GET',
+        $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($projectId) . '/users',
+        null,
+        $accessToken
+    );
+    if ($status < 200 || $status >= 300) return '';
+    foreach (($data['data'] ?? []) as $user) {
+        if (!is_array($user)) continue;
+        $id = (string)($user['id'] ?? $user['user_id'] ?? '');
+        if ($userId !== '' && $id !== '' && $id === $userId) {
+            return strtolower(trim((string)($user['role'] ?? '')));
+        }
+    }
+    return '';
+}
+
+function gbirds_frameio_role_allows_upload(string $role): bool {
+    return in_array(strtolower(trim($role)), ['admin', 'full_access', 'editor', 'edit_only'], true);
+}
+
+function gbirds_frameio_find_project(string $accessToken): array {
+    $cfg = gbirds_frameio_config();
+    [$acctStatus, $acctData] = gbirds_frameio_http('GET', $cfg['api_base'] . '/accounts?page_size=100', null, $accessToken);
+    if ($acctStatus < 200 || $acctStatus >= 300 || !is_array($acctData)) {
+        $detail = $acctData['message'] ?? ($acctData['error']['message'] ?? '');
+        throw new RuntimeException('Frame.io account lookup failed (' . $acctStatus . ')' . ($detail ? ': ' . $detail : '.') . ($acctStatus === 403 ? ' The authenticated Adobe/Frame.io user does not have V4 account access.' : ''));
+    }
+
+    $foundAccountCount = 0;
+    $lastProjectStatus = 0;
+    $lastProjectDetail = '';
+    foreach (($acctData['data'] ?? []) as $acct) {
+        if (!is_array($acct)) continue;
+        $accountId = trim((string)($acct['id'] ?? ''));
+        if ($accountId === '') continue;
+        $foundAccountCount++;
+
+        [$ps, $pd] = gbirds_frameio_http(
+            'GET',
+            $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($cfg['project_id']),
+            null,
+            $accessToken
+        );
+        $lastProjectStatus = $ps;
+        $lastProjectDetail = (string)($pd['message'] ?? ($pd['error']['message'] ?? ''));
+        if ($ps >= 200 && $ps < 300 && !empty($pd['data']) && is_array($pd['data'])) {
+            $project = $pd['data'];
+            $project['_frameio_account_id'] = $accountId;
+            $project['_frameio_account_name'] = (string)($acct['name'] ?? $acct['display_name'] ?? $acct['displayName'] ?? '');
+            gbirds_session_start();
+            $_SESSION['frameio_account_id'] = $accountId;
+            return [$project, $accountId];
+        }
+    }
+
+    if ($foundAccountCount === 0) {
+        throw new RuntimeException('Adobe IMS authentication succeeded, but Frame.io returned no accounts for this Adobe user.');
+    }
+
+    $detailSuffix = $lastProjectDetail ? ': ' . $lastProjectDetail : '';
+    throw new RuntimeException(
+        'The selected Adobe profile does not have access to Project_FIREBIRD (' . $cfg['project_id'] . '). ' .
+        'Sign out of Adobe at account.adobe.com, retry Send to Adobe, and choose the Adobe profile that owns or has access to Project_FIREBIRD.' .
+        ' (last project HTTP ' . $lastProjectStatus . ')' . $detailSuffix
+    );
+}
+
+function gbirds_frameio_find_date_collection(string $accessToken, string $accountId, string $projectId, string $dateName): array {
+    $cfg = gbirds_frameio_config();
+    $safeDateName = preg_replace('/[^0-9-]/', '-', trim($dateName));
+    $safeDateName = trim((string)$safeDateName, '-');
+    if ($safeDateName === '') $safeDateName = gmdate('Y-m-d');
+
+    gbirds_session_start();
+    $cacheKey = $safeDateName;
+    $cached = $_SESSION['frameio_date_collections'][$cacheKey] ?? null;
+    if (is_array($cached) && !empty($cached['id']) && !empty($cached['root_folder_id'])) {
+        return $cached;
+    }
+
+    [$status, $data] = gbirds_frameio_http(
+        'GET',
+        $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($projectId) . '/collections?page_size=100',
+        null,
+        $accessToken,
+        ['api-version: experimental']
+    );
+
+    if ($status < 200 || $status >= 300 || !is_array($data)) {
+        $detail = $data['message'] ?? ($data['error']['message'] ?? '');
+        throw new RuntimeException(
+            'Frame.io date-collection lookup failed (' . $status . ')' . ($detail ? ': ' . $detail : '.')
+        );
+    }
+
+    foreach (($data['data'] ?? []) as $collection) {
+        if (!is_array($collection)) continue;
+        $name = trim((string)($collection['name'] ?? ''));
+        $id = trim((string)($collection['id'] ?? ''));
+        $root = trim((string)($collection['root_folder_id'] ?? ''));
+        $collectionProjectId = trim((string)($collection['project_id'] ?? ''));
+        if ($name === $safeDateName && $id !== '' && ($collectionProjectId === '' || $collectionProjectId === $projectId)) {
+            $result = [
+                'id' => $id,
+                'name' => $name,
+                'root_folder_id' => $root,
+                'project_id' => $collectionProjectId ?: $projectId,
+                'exists' => true
+            ];
+            $_SESSION['frameio_date_collections'][$cacheKey] = $result;
+            return $result;
+        }
+    }
+
+    return [
+        'id' => '',
+        'name' => $safeDateName,
+        'root_folder_id' => '',
+        'project_id' => $projectId,
+        'exists' => false
+    ];
+}
+
+function gbirds_sanitize_frameio_filename(string $name): string {
+    $name = preg_replace('/[^A-Za-z0-9._ -]+/', '-', $name);
+    $name = preg_replace('/\s+/', ' ', trim($name));
+    return substr($name ?: 'bird-media', 0, 180);
+}
+
+/**
+ * Ensure a date-named folder (Y-m-d) exists directly under Project_FIREBIRD's
+ * root folder, creating it when missing. Frame.io V4 exposes no public
+ * create-collection API, but it does expose folder create/list, so FireBird
+ * uses a per-date folder as the required destination bucket. Returns
+ * ['id' => <folder_id>, 'name' => <date>, 'created' => bool].
+ */
+function gbirds_frameio_find_or_create_date_folder(string $accessToken, string $accountId, string $rootFolderId, string $dateName): array {
+    $cfg = gbirds_frameio_config();
+    $safe = preg_replace('/[^0-9-]/', '-', trim($dateName));
+    $safe = trim((string)$safe, '-');
+    if ($safe === '') $safe = gmdate('Y-m-d');
+
+    gbirds_session_start();
+    $cacheKey = $rootFolderId . '|' . $safe;
+    $cached = $_SESSION['frameio_date_folders'][$cacheKey] ?? null;
+    if (is_array($cached) && !empty($cached['id'])) return $cached;
+
+    $childrenUrl = $cfg['api_base'] . '/accounts/' . rawurlencode($accountId)
+        . '/folders/' . rawurlencode($rootFolderId) . '/children?page_size=100';
+
+    // 1) Reuse an existing date folder under the project root if one is present.
+    $existing = gbirds_frameio_match_child_folder($accessToken, $childrenUrl, $safe);
+    if ($existing !== '') {
+        $result = ['id' => $existing, 'name' => $safe, 'created' => false];
+        $_SESSION['frameio_date_folders'][$cacheKey] = $result;
+        return $result;
+    }
+
+    // 2) Create the date folder under the project root.
+    [$cstatus, $cdata] = gbirds_frameio_http(
+        'POST',
+        $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/folders/' . rawurlencode($rootFolderId) . '/folders',
+        ['data' => ['name' => $safe]],
+        $accessToken
+    );
+    $newId = trim((string)($cdata['data']['id'] ?? ''));
+    if ($cstatus >= 200 && $cstatus < 300 && $newId !== '') {
+        $result = ['id' => $newId, 'name' => $safe, 'created' => true];
+        $_SESSION['frameio_date_folders'][$cacheKey] = $result;
+        return $result;
+    }
+
+    // 3) A conflict (e.g. concurrent create) can mean it already exists; re-list once.
+    $recovered = gbirds_frameio_match_child_folder($accessToken, $childrenUrl, $safe);
+    if ($recovered !== '') {
+        $result = ['id' => $recovered, 'name' => $safe, 'created' => false];
+        $_SESSION['frameio_date_folders'][$cacheKey] = $result;
+        return $result;
+    }
+
+    $detail = $cdata['message'] ?? ($cdata['error']['message'] ?? ($cdata['_raw'] ?? ''));
+    throw new RuntimeException(
+        'FireBird could not create the Frame.io date folder "' . $safe . '" (' . $cstatus . ')' . ($detail ? ': ' . $detail : '.')
+    );
+}
+
+/**
+ * List a folder's children (one page of up to 100) and return the id of the
+ * first child folder whose name matches $name, or '' when none match.
+ */
+function gbirds_frameio_match_child_folder(string $accessToken, string $childrenUrl, string $name): string {
+    [$status, $data] = gbirds_frameio_http('GET', $childrenUrl, null, $accessToken);
+    if ($status < 200 || $status >= 300 || !is_array($data)) return '';
+    foreach (($data['data'] ?? []) as $child) {
+        if (!is_array($child)) continue;
+        $type = strtolower(trim((string)($child['type'] ?? '')));
+        $childName = trim((string)($child['name'] ?? ''));
+        $id = trim((string)($child['id'] ?? ''));
+        if ($childName === $name && $id !== '' && ($type === '' || $type === 'folder')) {
+            return $id;
+        }
+    }
+    return '';
+}
+
+/**
+ * List a folder's children (one page of up to 100) and return the id of the first
+ * child FILE (or version_stack) whose name matches $name, or '' when none match.
+ * Used to detect a media that was already uploaded (dedupe).
+ */
+function gbirds_frameio_find_child_file_by_name(string $accessToken, string $childrenUrl, string $name): string {
+    [$status, $data] = gbirds_frameio_http('GET', $childrenUrl, null, $accessToken);
+    if ($status < 200 || $status >= 300 || !is_array($data)) return '';
+    foreach (($data['data'] ?? []) as $child) {
+        if (!is_array($child)) continue;
+        $type = strtolower(trim((string)($child['type'] ?? '')));
+        if (trim((string)($child['name'] ?? '')) === $name && ($type === 'file' || $type === 'version_stack' || $type === '')) {
+            $id = trim((string)($child['id'] ?? ''));
+            if ($id !== '') return $id;
+        }
+    }
+    return '';
+}
+
+/**
+ * Resolve the uploadable root folder id for a target collection inside a project,
+ * matched by id first then by (case-insensitive) name. Frame.io V4 has no
+ * "show single collection" endpoint, so we list the project's collections and
+ * match locally. Returns ['id'=>collectionId,'root_folder_id'=>folderId] with
+ * empty strings when the collection is dynamic/aggregated (no uploadable root
+ * folder), not found, or the listing endpoint is unavailable — the caller then
+ * falls back to the project root.
+ */
+function gbirds_frameio_collection_root_folder(string $accessToken, string $accountId, string $projectId, string $collectionId, string $collectionName = ''): array {
+    $none = ['id' => '', 'root_folder_id' => ''];
+    if ($collectionId === '' && $collectionName === '') return $none;
+    $cfg = gbirds_frameio_config();
+    [$status, $data] = gbirds_frameio_http(
+        'GET',
+        $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/projects/' . rawurlencode($projectId) . '/collections?page_size=100',
+        null,
+        $accessToken,
+        ['api-version: experimental']
+    );
+    if ($status < 200 || $status >= 300 || !is_array($data)) return $none;
+    $wantName = strtolower(trim($collectionName));
+    $byName = null;
+    foreach (($data['data'] ?? []) as $collection) {
+        if (!is_array($collection)) continue;
+        $id = trim((string)($collection['id'] ?? ''));
+        $root = trim((string)($collection['root_folder_id'] ?? ''));
+        if ($collectionId !== '' && $id === $collectionId) {
+            return ['id' => $id, 'root_folder_id' => $root];
+        }
+        if ($byName === null && $wantName !== '' && strtolower(trim((string)($collection['name'] ?? ''))) === $wantName) {
+            $byName = ['id' => $id, 'root_folder_id' => $root];
+        }
+    }
+    return $byName ?? $none;
+}
+
+function gbirds_frameio_start_auth_for_pending(array $pending): void {
+    gbirds_session_start();
+    $_SESSION['frameio_pending_upload'] = [
+        'mediaUrl' => trim((string)($pending['mediaUrl'] ?? '')),
+        'filename' => trim((string)($pending['filename'] ?? '')),
+        'createdAt' => trim((string)($pending['createdAt'] ?? '')),
+        'species' => trim((string)($pending['species'] ?? '')),
+        'postcardId' => trim((string)($pending['postcardId'] ?? ''))
+    ];
+    // A deliberate first-click authentication gate: discard any old Frame.io
+    // token so the Adobe IMS flow cannot silently reuse the wrong profile.
+    unset(
+        $_SESSION['frameio_access_token'],
+        $_SESSION['frameio_refresh_token'],
+        $_SESSION['frameio_expires_at'],
+        $_SESSION['frameio_usage_authenticated'],
+        $_SESSION['frameio_account_id'],
+        $_SESSION['frameio_date_folders'],
+        $_SESSION['frameio_ims_org_id'],
+        $_SESSION['frameio_ims_user_id']
+    );
+    $_SESSION['frameio_usage_authenticated'] = false;
+    try {
+        $authorizeUrl = gbirds_frameio_authorize_url();
+    } catch (Throwable $e) {
+        gbirds_json_response(['ok'=>false,'error'=>$e->getMessage(),'stage'=>'frameio-auth-start'],500);
+    }
+    gbirds_json_response([
+        'ok' => false,
+        'needsAuth' => true,
+        'forceLogin' => true,
+        'authorizeUrl' => $authorizeUrl
+    ], 401);
+}
+
+function gbirds_frameio_send(): void {
+    gbirds_session_start();
+    $cfg = gbirds_frameio_config();
+    $cfg = gbirds_frameio_config();
+    $input = json_decode((string)file_get_contents('php://input'), true);
+    if (!is_array($input)) $input = $_POST;
+    if (!is_array($input) || empty($input)) {
+        $input = $GLOBALS['gbirds_frameio_pending_resume'] ?? ($_SESSION['frameio_pending_upload'] ?? []);
+    }
+
+    $mediaUrl = trim((string)($input['mediaUrl'] ?? ''));
+    $filename = trim((string)($input['filename'] ?? ''));
+    $createdAt = trim((string)($input['createdAt'] ?? ''));
+    $species = trim((string)($input['species'] ?? ''));
+    $postcardId = trim((string)($input['postcardId'] ?? ''));
+    if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
+        gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
+    }
+    if ($filename === '') {
+        $filename = 'file_' . md5($mediaUrl) . (preg_match('/\.mp4(?:$|[?#])/i',$mediaUrl) ? '.mp4' : '.jpg');
+    }
+
+    // First Send to Adobe for this browser-tab usage always starts a fresh Adobe
+    // IMS login. This prevents an existing server/browser session from selecting
+    // the wrong Adobe profile before the user authenticates for FireBird.
+    if (empty($_SESSION['frameio_usage_authenticated'])) {
+        gbirds_frameio_start_auth_for_pending([
+            'mediaUrl'=>$mediaUrl,
+            'filename'=>$filename,
+            'createdAt'=>$createdAt,
+            'species'=>$species,
+            'postcardId'=>$postcardId
+        ]);
+    }
+
+    try {
+        $token = gbirds_frameio_access_token();
+    } catch (RuntimeException $e) {
+        $_SESSION['frameio_pending_upload'] = [
+            'mediaUrl'=>$mediaUrl,
+            'filename'=>$filename,
+            'createdAt'=>$createdAt,
+            'species'=>$species,
+            'postcardId'=>$postcardId
+        ];
+        gbirds_json_response([
+            'ok'=>false,
+            'needsAuth'=>true,
+            'forceLogin'=>true,
+            'authorizeUrl'=>gbirds_frameio_authorize_url()
+        ],401);
+    }
+
+    try {
+        [$project, $accountId] = gbirds_frameio_find_project($token);
+
+        // Verify the authenticated Adobe/Frame.io identity before touching folders.
+        // A valid IMS token can still represent the wrong Adobe profile, or a user
+        // can have view-only access to Project_FIREBIRD. In either case, stop here
+        // with a useful message rather than producing a confusing folder 403.
+        $me = gbirds_frameio_get_me($token);
+        $meData = is_array($me['data'] ?? null) ? $me['data'] : $me;
+        $userId = (string)($meData['user_id'] ?? $meData['id'] ?? $meData['user']['id'] ?? '');
+        $role = $userId !== '' ? gbirds_frameio_project_user_role($token, $accountId, $cfg['project_id'], $userId) : '';
+        if ($role !== '' && !gbirds_frameio_role_allows_upload($role)) {
+            throw new RuntimeException(
+                'The authenticated Adobe profile has Frame.io project role "' . $role . '" and cannot upload/manage Project_FIREBIRD. ' .
+                'Switch Adobe to the profile that has Editor or Full Access to Project_FIREBIRD, then retry Send to Adobe. ' .
+                'Adobe does not provide an OAuth parameter that can force its profile chooser; its automatic profile selection is controlled by Adobe.'
+            );
+        }
+        $dateTs = $createdAt !== '' ? strtotime($createdAt) : false;
+        $dateName = $dateTs ? gmdate('Y-m-d', $dateTs) : gmdate('Y-m-d');
+
+        // FireBird's destination is a DATE-SPECIFIC folder inside Project_FIREBIRD.
+        // Base folder resolution order:
+        //   1) An explicitly configured folder id (the "BIRDS" folder in Assets).
+        //   2) The configured target COLLECTION's root_folder_id (static collection).
+        //   3) The project root folder, if neither of the above is resolvable.
+        // A date-named folder (Y-m-d) is then found-or-created under that base and
+        // used as the upload target, guaranteeing the destination exists first.
+        $wantFolderId = trim((string)($cfg['folder_id'] ?? ''));
+        $wantCollectionId = trim((string)($cfg['collection_id'] ?? ''));
+        $wantCollectionName = trim((string)($cfg['collection_name'] ?? ''));
+        $collectionId = '';
+        $baseFolderId = '';
+        $destination = 'project';
+        if ($wantFolderId !== '') {
+            $baseFolderId = $wantFolderId;
+            $destination = 'folder';
+        }
+        if ($baseFolderId === '' && ($wantCollectionId !== '' || $wantCollectionName !== '')) {
+            // Experimental endpoint — never let it abort the upload.
+            try {
+                $resolved = gbirds_frameio_collection_root_folder($token, $accountId, $cfg['project_id'], $wantCollectionId, $wantCollectionName);
+                $baseFolderId = trim((string)($resolved['root_folder_id'] ?? ''));
+                $collectionId = trim((string)($resolved['id'] ?? ''));
+            } catch (Throwable $collLookupError) {
+                error_log('GetBirds Frame.io collection resolve skipped: ' . $collLookupError->getMessage());
+            }
+            if ($baseFolderId !== '') $destination = 'collection';
+        }
+        if ($baseFolderId === '') {
+            $baseFolderId = trim((string)($project['root_folder_id'] ?? ($project['data']['root_folder_id'] ?? '')));
+            $destination = 'project';
+        }
+        if ($baseFolderId === '') {
+            throw new RuntimeException(
+                'Project_FIREBIRD returned no uploadable folder (no collection root folder and no project root folder), ' .
+                'so FireBird cannot create the "' . $dateName . '" date folder.'
+            );
+        }
+
+        $dateFolder = gbirds_frameio_find_or_create_date_folder($token, $accountId, $baseFolderId, $dateName);
+        $folderId = trim((string)($dateFolder['id'] ?? ''));
+        if ($folderId === '') {
+            throw new RuntimeException('FireBird could not resolve a Frame.io destination folder for "' . $dateName . '".');
+        }
+
+        $nameBits = [];
+        if ($dateTs) $nameBits[] = gmdate('Y-m-d_H-i-s', $dateTs);
+        if ($species !== '') $nameBits[] = $species;
+        $nameBits[] = pathinfo($filename, PATHINFO_FILENAME);
+        $ext = pathinfo($filename, PATHINFO_EXTENSION);
+        $remoteName = gbirds_sanitize_frameio_filename(implode('_', $nameBits) . ($ext ? '.' . strtolower($ext) : ''));
+
+        $cfg = gbirds_frameio_config();
+
+        // DEDUPE (authoritative, server-side): the remote name is deterministic for
+        // a given media (it embeds file_<md5(mediaUrl)>). If a file with that exact
+        // name already exists in the date folder, this media was already pushed to
+        // Frame.io — do NOT upload again; return the existing asset's preview link.
+        $dupChildrenUrl = $cfg['api_base'] . '/accounts/' . rawurlencode($accountId)
+            . '/folders/' . rawurlencode($folderId) . '/children?page_size=100';
+        $existingFileId = gbirds_frameio_find_child_file_by_name($token, $dupChildrenUrl, $remoteName);
+        if ($existingFileId !== '') {
+            $dupViewUrl = 'https://next.frame.io/project/' . rawurlencode($cfg['project_id']) . '/view/' . rawurlencode($existingFileId);
+            unset($_SESSION['frameio_pending_upload']);
+            gbirds_json_response([
+                'ok'=>true,
+                'status'=>'already-sent',
+                'duplicate'=>true,
+                'projectId'=>$project['id'] ?? $cfg['project_id'],
+                'projectName'=>$project['name'] ?? 'Project_FIREBIRD',
+                'destination'=>$destination,
+                'folderId'=>$folderId,
+                'dateName'=>$dateName,
+                'file'=>['id'=>$existingFileId,'name'=>$remoteName],
+                'viewUrl'=>$dupViewUrl,
+                'projectUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id'])
+            ]);
+        }
+
+        [$status, $upload] = gbirds_frameio_http(
+            'POST',
+            $cfg['api_base'] . '/accounts/' . rawurlencode($accountId) . '/folders/' . rawurlencode($folderId) . '/files/remote_upload',
+            ['data'=>['name'=>$remoteName,'source_url'=>$mediaUrl]],
+            $token
+        );
+
+        if ($status === 401) {
+            gbirds_frameio_clear_session();
+            $_SESSION['frameio_usage_authenticated'] = false;
+            $_SESSION['frameio_pending_upload'] = [
+                'mediaUrl'=>$mediaUrl,
+                'filename'=>$filename,
+                'createdAt'=>$createdAt,
+                'species'=>$species,
+                'postcardId'=>$postcardId
+            ];
+            try {
+                $authorizeUrl = gbirds_frameio_authorize_url();
+            } catch (Throwable $authUrlError) {
+                error_log('GetBirds Frame.io reauthorize URL failed: ' . $authUrlError->getMessage());
+                gbirds_json_response(['ok'=>false,'error'=>$authUrlError->getMessage(),'stage'=>'frameio-reauthorize'],500);
+            }
+            gbirds_json_response([
+                'ok'=>false,
+                'needsAuth'=>true,
+                'authorizeUrl'=>$authorizeUrl
+            ],401);
+        }
+
+        if ($status < 200 || $status >= 300 || empty($upload['data'])) {
+            $msg = $upload['message'] ?? (($upload['error']['message'] ?? null) ?: ('Frame.io upload failed (' . $status . ').'));
+            $detail = $upload['detail'] ?? ($upload['error']['detail'] ?? '');
+            if ($detail && $detail !== $msg) $msg .= ' — ' . $detail;
+            throw new RuntimeException($msg);
+        }
+
+        $fileData = is_array($upload['data']) ? $upload['data'] : [];
+        $fileId = trim((string)($fileData['id'] ?? ''));
+        // Build Frame.io's canonical single-asset PREVIEW deep link from the new
+        // file id: /project/{project_id}/view/{file_id}. We construct this rather
+        // than trusting the API's view_url, because for a freshly created
+        // remote_upload view_url points at the PARENT FOLDER (lands in the Assets
+        // folder) instead of the asset itself. Fall back to the API view_url only
+        // when no file id is returned.
+        $apiViewUrl = trim((string)($fileData['view_url'] ?? $fileData['viewUrl'] ?? ''));
+        if ($fileId !== '') {
+            $viewUrl = 'https://next.frame.io/project/' . rawurlencode($cfg['project_id']) . '/view/' . rawurlencode($fileId);
+        } else {
+            $viewUrl = $apiViewUrl;
+        }
+        unset($_SESSION['frameio_pending_upload']);
+        gbirds_json_response([
+            'ok'=>true,
+            'status'=>'sent',
+            'projectId'=>$project['id'] ?? $cfg['project_id'],
+            'projectName'=>$project['name'] ?? 'Project_FIREBIRD',
+            'destination'=>$destination,
+            'folderId'=>$folderId,
+            'collectionId'=>$destination === 'collection' ? $collectionId : '',
+            'dateName'=>$dateName,
+            'folderName'=>$dateName,
+            'file'=>$fileData,
+            'viewUrl'=>$viewUrl,
+            'projectUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id']),
+            'links'=>$upload['links'] ?? null
+        ]);
+    } catch (Throwable $e) {
+        // Never allow Frame.io failures to become an opaque Apache/PHP 500.
+        // Return a JSON error so the browser can show the actual server-side cause.
+        error_log('GetBirds Frame.io send failed: ' . $e->getMessage());
+        gbirds_json_response([
+            'ok'=>false,
+            'error'=>$e->getMessage() ?: 'Frame.io send failed.',
+            'stage'=>'frameio-send'
+        ],500);
+    }
+}
+
+function gbirds_frameio_resume_send(): void {
+    gbirds_session_start();
+    $pending = $_SESSION['frameio_pending_upload'] ?? null;
+    if (!is_array($pending) || empty($pending['mediaUrl'])) {
+        gbirds_json_response(['ok'=>false,'error'=>'No pending Adobe media upload was found.'],409);
+    }
+    $GLOBALS['gbirds_frameio_pending_resume'] = $pending;
+    gbirds_frameio_send();
+}
+
+function gbirds_frameio_status(): void {
+    gbirds_session_start();
+    $configured = gbirds_frameio_config()['client_id'] !== '' && gbirds_frameio_config()['client_secret'] !== '';
+    $authenticated = false;
+    if ($configured) { try { $authenticated = gbirds_frameio_token_is_fresh() || gbirds_frameio_refresh(); } catch (Throwable $e) {} }
+    // "ready" is the true "can Send to Adobe without logging in again" signal: the
+    // browser-tab usage completed the Adobe login AND a usable token is available.
+    // The client uses this to require only ONE master login per browser session.
+    $ready = !empty($_SESSION['frameio_usage_authenticated']) && $authenticated;
+    $cfg = gbirds_frameio_config();
+    gbirds_json_response([
+        'ok'=>true,
+        'configured'=>$configured,
+        'authenticated'=>$authenticated,
+        'ready'=>$ready,
+        'build'=>defined('FIREBIRD_BUILD_VERSION') ? FIREBIRD_BUILD_VERSION : 'unknown',
+        'projectId'=>$cfg['project_id'],
+        'collectionId'=>$cfg['collection_id']
+    ]);
+}
+
+function gbirds_frameio_login(): void {
+    try { header('Location: ' . gbirds_frameio_authorize_url(), true, 302); exit; } catch (Throwable $e) { gbirds_json_response(['ok'=>false,'error'=>$e->getMessage()],500); }
+}
+
+/**
+ * Render the OAuth callback result for the POPUP auth flow. When opened as a
+ * popup (window.opener present, same origin) it posts a message to the GetBirds
+ * page and stays put so the opener can drive the upload and reuse this window for
+ * the asset preview — the main app never reloads (smooth, YouTube-like UX).
+ * When there is no opener (popup blocked → login happened in the main tab) it
+ * falls back to the original full-page redirect so the flow still completes.
+ */
+function gbirds_frameio_render_popup_result(bool $ok, string $error = ''): void {
+    $appBase = 'https://hh5hh.com/gbirds.php';
+    $redirect = $ok
+        ? ($appBase . (!empty($_SESSION['frameio_pending_upload']['mediaUrl']) ? '?frameio_resume=1' : '?frameio_connected=1'))
+        : ($appBase . '?frameio_auth_error=1');
+    // JSON_HEX_TAG escapes < and > so a stray "</script>" in an Adobe error string
+    // can never break out of the inline <script> below.
+    $jsonFlags = JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP;
+    $payload = json_encode(['type' => 'firebird-frameio-auth', 'ok' => $ok, 'error' => $error], $jsonFlags);
+    $redirectJs = json_encode($redirect, $jsonFlags);
+    $origin = json_encode('https://hh5hh.com', $jsonFlags);
+    $msg = $ok ? 'Signed in to Adobe — finishing your upload…' : ('Adobe sign-in failed' . ($error !== '' ? ': ' . htmlspecialchars($error, ENT_QUOTES) : '.'));
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html><head><meta charset="utf-8"><title>Adobe sign-in</title>'
+        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        . '<style>body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0f1115;color:#e8eaed;'
+        . 'display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px;text-align:center}'
+        . '.card{max-width:420px}button{margin-top:16px;padding:10px 18px;border-radius:8px;border:0;background:#2b6cff;color:#fff;font-size:14px;cursor:pointer}</style></head>'
+        . '<body><div class="card"><p>' . $msg . '</p>'
+        . '<button type="button" onclick="__done()">Close</button></div>'
+        . '<script>(function(){'
+        . 'var payload=' . $payload . ';var origin=' . $origin . ';var redirect=' . $redirectJs . ';'
+        . 'var hasOpener=false;try{hasOpener=!!(window.opener&&!window.opener.closed);}catch(e){hasOpener=!!window.opener;}'
+        . 'if(hasOpener){try{window.opener.postMessage(payload,origin);}catch(e){}'
+        // Popup: let the opener drive from here. On error close soon; on success
+        // the opener navigates this window to the asset preview (or closes it).
+        . 'window.__done=function(){try{window.close();}catch(e){}};'
+        . 'if(!payload.ok){setTimeout(function(){try{window.close();}catch(e){}},1500);}'
+        . '}else{'
+        // No opener → this is the main tab (popup was blocked). Redirect the app.
+        . 'window.__done=function(){window.location.replace(redirect);};'
+        . 'window.location.replace(redirect);'
+        . '}'
+        . '})();</script></body></html>';
+    exit;
+}
+
+function gbirds_frameio_callback(): void {
+    gbirds_session_start();
+
+    // Handle IMS authorization errors first. Adobe may omit state on an error
+    // response such as invalid_scope; never misreport that as an OAuth state error.
+    if (!empty($_GET['error'])) {
+        $error = trim((string)($_GET['error'] ?? 'authorization_failed'));
+        $description = trim((string)($_GET['error_description'] ?? 'Adobe authorization was cancelled or denied.'));
+        unset($_SESSION['frameio_oauth_state']);
+        unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_usage_authenticated']);
+        $_SESSION['frameio_auth_error'] = $error . ($description ? ': ' . $description : '');
+        gbirds_frameio_render_popup_result(false, $error . ($description ? ': ' . $description : ''));
+    }
+
+    $state = (string)($_GET['state'] ?? '');
+    $expectedState = (string)($_SESSION['frameio_oauth_state'] ?? '');
+    if ($state === '' || $expectedState === '' || !hash_equals($expectedState, $state)) {
+        unset($_SESSION['frameio_oauth_state']);
+        gbirds_frameio_render_popup_result(false, 'Invalid Adobe OAuth state.');
+    }
+    unset($_SESSION['frameio_oauth_state']);
+
+    $code = trim((string)($_GET['code'] ?? ''));
+    if ($code === '') {
+        gbirds_frameio_render_popup_result(false, 'Adobe IMS returned no authorization code.');
+    }
+
+    try {
+        $tokens = gbirds_frameio_exchange_code($code);
+        gbirds_frameio_store_tokens($tokens);
+        $_SESSION['frameio_usage_authenticated'] = true;
+        $_SESSION['frameio_authenticated_at'] = time();
+        unset($_SESSION['frameio_account_id']);
+        unset($_SESSION['frameio_auth_error']);
+        gbirds_frameio_capture_ims_context($tokens);
+    } catch (Throwable $e) {
+        $_SESSION['frameio_auth_error'] = $e->getMessage();
+        gbirds_frameio_render_popup_result(false, $e->getMessage());
+    }
+
+    gbirds_frameio_render_popup_result(true);
+}
+
+function gbirds_frameio_auth_config(): void {
+    $cfg = gbirds_frameio_config();
+    gbirds_json_response([
+        'ok' => true,
+        'configured' => $cfg['client_id'] !== '' && $cfg['client_secret'] !== '',
+        'clientIdPresent' => $cfg['client_id'] !== '',
+        'clientSecretPresent' => $cfg['client_secret'] !== '',
+        'redirectUri' => $cfg['redirect_uri'],
+        'scopes' => preg_split('/\\s*[,\\s]+\\s*/', trim($cfg['scopes'])) ?: [],
+        'projectId' => $cfg['project_id']
+    ]);
+}
+
+function gbirds_frameio_debug(): void {
+    try {
+        $token = gbirds_frameio_access_token();
+        $cfg = gbirds_frameio_config();
+        [$meStatus, $meData] = gbirds_frameio_http('GET', $cfg['api_base'] . '/me', null, $token);
+        [$acctStatus, $acctData] = gbirds_frameio_http('GET', $cfg['api_base'] . '/accounts', null, $token);
+        $projectStatus = null; $project = null; $accountId = null;
+        foreach (($acctData['data'] ?? []) as $acct) {
+            $aid = (string)($acct['id'] ?? '');
+            if (!$aid) continue;
+            [$ps, $pd] = gbirds_frameio_http('GET', $cfg['api_base'] . '/accounts/' . rawurlencode($aid) . '/projects/' . rawurlencode($cfg['project_id']), null, $token);
+            if ($ps >= 200 && $ps < 300 && !empty($pd['data'])) { $projectStatus = $ps; $project = $pd['data']; $accountId = $aid; break; }
+            $projectStatus = $ps;
+        }
+        gbirds_json_response([
+            'ok'=>true,
+            'me'=>['http'=>$meStatus,'userId'=>$meData['user_id'] ?? ($meData['data']['id'] ?? null),'email'=>$meData['email'] ?? ($meData['data']['email'] ?? null)],
+            'accounts'=>['http'=>$acctStatus,'count'=>is_array($acctData['data'] ?? null) ? count($acctData['data']) : 0],
+            'project'=>['id'=>$cfg['project_id'],'http'=>$projectStatus,'found'=>!!$project,'accountId'=>$accountId,'name'=>$project['name'] ?? null,'rootFolderId'=>$project['root_folder_id'] ?? null]
+        ]);
+    } catch (Throwable $e) {
+        gbirds_json_response(['ok'=>false,'error'=>$e->getMessage(),'stage'=>'frameio-debug'],500);
+    }
+}
+
+
+function gbirds_frameio_collections_debug(): void {
+    try {
+        $token = gbirds_frameio_access_token();
+        $cfg = gbirds_frameio_config();
+        [$project, $accountId] = gbirds_frameio_find_project($token);
+        $collections = gbirds_frameio_find_date_collection($token, $accountId, $cfg['project_id'], gmdate('Y-m-d'));
+        gbirds_json_response([
+            'ok'=>true,
+            'projectId'=>$cfg['project_id'],
+            'projectName'=>$project['name'] ?? 'Project_FIREBIRD',
+            'accountId'=>$accountId,
+            'date'=>gmdate('Y-m-d'),
+            'collection'=>$collections
+        ]);
+    } catch (Throwable $e) {
+        gbirds_json_response(['ok'=>false,'error'=>$e->getMessage(),'stage'=>'frameio-collections-debug'],500);
+    }
+}
+
 function gbirds_firebird_placeholder(): void {
     gbirds_json_response([
         'ok' => false,
@@ -190,9 +1230,35 @@ function gbirds_firebird_placeholder(): void {
     ], 501);
 }
 
+
+if (!empty($_GET['frameio_resume'])) {
+    gbirds_session_start();
+    // Keep the pending payload in session until the resume request succeeds.
+    // The previous build unset it here, so frameio-resume-send had nothing to read.
+    if (!empty($_SESSION['frameio_pending_upload']['mediaUrl'])) {
+        $GLOBALS['gbirds_frameio_pending_resume'] = $_SESSION['frameio_pending_upload'];
+    }
+}
+
 $api = strtolower(trim((string)($_GET['api'] ?? '')));
 if ($api === 'birdbuddy') gbirds_proxy_graphql();
 if ($api === 'birdbuddy-media') gbirds_proxy_media();
+if ($api === 'frameio-auth-begin') gbirds_frameio_begin_auth();
+if ($api === 'frameio-auth-reset') {
+    gbirds_frameio_clear_session();
+    header('Location: https://account.adobe.com/', true, 302);
+    exit;
+}
+if ($api === 'frameio-login') gbirds_frameio_login();
+if ($api === 'frameio-callback') gbirds_frameio_callback();
+if ($api === 'frameio-status') gbirds_frameio_status();
+if ($api === 'frameio-begin-usage') gbirds_frameio_begin_usage();
+if ($api === 'frameio-send') gbirds_frameio_send();
+if ($api === 'frameio-resume-send') gbirds_frameio_resume_send();
+if ($api === 'frameio-auth-config') gbirds_frameio_auth_config();
+if ($api === 'frameio-debug') gbirds_frameio_debug();
+if ($api === 'frameio-collections-debug') gbirds_frameio_collections_debug();
+if ($api === 'frameio-logout') { gbirds_frameio_clear_session(); gbirds_json_response(['ok'=>true]); }
 if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 ?>
 <!DOCTYPE html>
@@ -530,6 +1596,43 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     .media-link:hover {
       background: var(--accent);
     }
+
+    .media-actions {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      display: flex;
+      opacity: 0;
+      transition: opacity 0.2s;
+      z-index: 3;
+    }
+    .media-card:hover .media-actions, .media-card:focus-within .media-actions { opacity: 1; }
+    .media-actions .media-link, .media-actions .media-send-link {
+      position: static;
+      flex: 1 1 50%;
+      width: auto;
+      opacity: 1;
+      border: 0;
+      border-radius: 0;
+      padding: 0.55rem 0.45rem;
+      background: rgba(26,26,26,0.88);
+      color: #fff;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-align: center;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .media-actions .media-send-link { border-left: 1px solid rgba(255,255,255,0.18); }
+    .media-actions .media-link:hover { background: rgba(26,26,26,0.96); color: #fff; }
+    .media-actions .media-send-link:hover { background: var(--accent); color: #fff; }
+    .media-actions .media-send-link.sent { background: #356b52; }
+    .media-actions .media-send-link.frameio-sent { background: #2f5a46; cursor: default; }
+    .media-actions .media-send-link.frameio-sent:hover { background: #356b52; color: #dfeee7; }
+    .media-actions .media-send-link.uploading { opacity: 0.85; pointer-events: none; }
+    @media (max-width: 640px) { .media-actions { opacity: 1; } }
+
 
     .media-loading,
     .media-error,
@@ -1259,6 +2362,15 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const BB_GRAPHQL_OVERRIDE_QUERY_KEYS = ["bb_graphql", "bbGraphql", "graphql"];
   const BB_GRAPHQL_ALLOW_DIRECT_QUERY_KEYS = ["bb_graphql_direct", "bbGraphqlDirect"];
   const BIRDBUDDY_MEDIA_PROXY = "./gbirds.php?api=birdbuddy-media";
+  const FRAMEIO_USAGE_KEY = "firebird_firebird_frameio_usage_id_v4";
+  const FRAMEIO_BEGIN_USAGE = "./gbirds.php?api=frameio-begin-usage";
+  const GBIRDS_FRAMEIO_BASE = "https://hh5hh.com/gbirds.php";
+  const FRAMEIO_PROJECT_ID = "f7f67254-9ec8-4e2c-99f8-32cd31123eef";
+  // Durable (per-browser) map of media already pushed to Frame.io: mediaKey -> viewUrl.
+  const FRAMEIO_SENT_KEY = "firebird_frameio_sent_v1";
+  // Fast-path flag: server session is known-authenticated, so Send to Adobe can
+  // skip re-login (enforces "one master login" per browser session).
+  const FRAMEIO_AUTHED_FLAG = "firebird_frameio_authed_v1";
 
   const STORAGE_KEYS = {
     googleAccessToken: "google_access_token",
@@ -3128,6 +4240,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
           img.alt = "Postcard";
           card.appendChild(img);
         }
+        var actionsBar = document.createElement("div");
+        actionsBar.className = "media-actions";
+
         var a = document.createElement("a");
         a.className = "media-link";
         a.href = m.url;
@@ -3141,7 +4256,29 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
             setHeaderStatus((err && err.message) || "Download failed.", true);
           });
         });
-        card.appendChild(a);
+        actionsBar.appendChild(a);
+
+        var send = document.createElement("a");
+        send.className = "media-send-link";
+        send.href = "#";
+        send.textContent = "Send to Adobe";
+        send.setAttribute("role", "button");
+        send.setAttribute("data-frameio-button", "true");
+        var sendKey = frameioMediaKey(m);
+        if (sendKey) send.setAttribute("data-frameio-key", sendKey);
+        // If this media was already pushed to Frame.io, show it as sent (re-upload
+        // is blocked; clicking re-opens the existing asset preview).
+        if (sendKey && isFrameioSent(sendKey)) {
+          setSendToAdobeButton(send, "sent", "Sent to Adobe ✓");
+          send.setAttribute("aria-disabled", "true");
+          send.classList.add("frameio-sent");
+        }
+        send.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          onSendToAdobe(postcard, m, send);
+        });
+        actionsBar.appendChild(send);
+        card.appendChild(actionsBar);
         grid.appendChild(card);
       });
       wrap.appendChild(grid);
@@ -3486,6 +4623,384 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         setHeaderStatus(e.message || "Save to collection failed", true);
       })
       .finally(function () { setBusy(false); });
+  }
+
+  function setSendToAdobeButton(button, state, label) {
+    if (!button) return;
+    button.classList.remove("uploading", "sent");
+    if (state === "uploading") {
+      button.classList.add("uploading");
+      button.textContent = label || "Sending…";
+      button.setAttribute("aria-busy", "true");
+    } else if (state === "sent") {
+      button.classList.add("sent");
+      button.textContent = label || "Sent to Adobe";
+      button.removeAttribute("aria-busy");
+    } else {
+      button.textContent = label || "Send to Adobe";
+      button.removeAttribute("aria-busy");
+    }
+  }
+
+  function getFrameioUsageId() {
+    // Persist in localStorage (not sessionStorage) so every tab/reload in this
+    // browser reuses the SAME server-side Adobe session — a new tab must not force
+    // another Adobe login. One master login per browser session.
+    var id = "";
+    try { id = localStorage.getItem(FRAMEIO_USAGE_KEY) || ""; } catch (_) {}
+    if (!id) { try { id = sessionStorage.getItem(FRAMEIO_USAGE_KEY) || ""; } catch (_) {} }
+    if (!id || !/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
+      if (window.crypto && crypto.randomUUID) {
+        id = crypto.randomUUID().replace(/-/g, "");
+      } else {
+        id = (Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).replace(/[^A-Za-z0-9_-]/g, "");
+      }
+    }
+    try { localStorage.setItem(FRAMEIO_USAGE_KEY, id); } catch (_) {}
+    try { sessionStorage.setItem(FRAMEIO_USAGE_KEY, id); } catch (_) {}
+    return id;
+  }
+
+  // ----- Dedupe + auth-state helpers (media already pushed to Frame.io) -----
+  function frameioMediaKey(m) {
+    var basis = (m && m.url) ? String(m.url) : String((m && m.id) || "");
+    try { return basis ? md5HashString(basis) : ""; } catch (_) { return ""; }
+  }
+  function loadFrameioSentMap() {
+    try { return JSON.parse(localStorage.getItem(FRAMEIO_SENT_KEY) || "{}") || {}; } catch (_) { return {}; }
+  }
+  function isFrameioSent(key) {
+    if (!key) return false;
+    var m = loadFrameioSentMap();
+    return Object.prototype.hasOwnProperty.call(m, key);
+  }
+  function getFrameioSentUrl(key) {
+    var m = loadFrameioSentMap();
+    return (key && m[key]) ? m[key] : "";
+  }
+  function recordFrameioSent(key, url) {
+    if (!key) return;
+    var m = loadFrameioSentMap();
+    m[key] = url || m[key] || "sent";
+    try { localStorage.setItem(FRAMEIO_SENT_KEY, JSON.stringify(m)); } catch (_) {}
+  }
+  function markFrameioSentButtons(key) {
+    if (!key || !mediaGrid) return;
+    try {
+      mediaGrid.querySelectorAll('[data-frameio-button="true"][data-frameio-key="' + key + '"]').forEach(function (btn) {
+        setSendToAdobeButton(btn, "sent", "Sent to Adobe ✓");
+        btn.setAttribute("aria-disabled", "true");
+        btn.classList.add("frameio-sent");
+      });
+    } catch (_) {}
+  }
+  function setFrameioAuthed(on) {
+    try {
+      if (on) localStorage.setItem(FRAMEIO_AUTHED_FLAG, "1");
+      else localStorage.removeItem(FRAMEIO_AUTHED_FLAG);
+    } catch (_) {}
+  }
+  function isFrameioAuthedFlag() {
+    try { return localStorage.getItem(FRAMEIO_AUTHED_FLAG) === "1"; } catch (_) { return false; }
+  }
+
+  function beginFrameioUsage() {
+    var usageId = getFrameioUsageId();
+    return fetch(FRAMEIO_BEGIN_USAGE + "&usage_id=" + encodeURIComponent(usageId), { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) { return r.json().then(function (d) { return { response: r, data: d }; }); })
+      .then(function (result) {
+        if (!result.response.ok || !result.data.ok) throw new Error(result.data.error || "Could not initialize Adobe session.");
+        return result.data;
+      });
+  }
+
+  function frameioStatus() {
+    return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-status", { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) { return r.json().then(function (d) { return { response:r, data:d }; }); });
+  }
+
+  function startFrameioLogin() {
+    return frameioStatus().then(function (result) {
+      var data = result.data || {};
+      if (!data.configured) throw new Error("Frame.io is not configured on the server.");
+      window.location.href = GBIRDS_FRAMEIO_BASE + "?api=frameio-login";
+      return new Promise(function () {});
+    });
+  }
+
+  function sendToFrameio(postcard, media) {
+    return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({
+        mediaUrl: media.url,
+        filename: filenameFromMedia(media),
+        createdAt: postcard.createdAt || "",
+        species: formatSpeciesLabel(postcard),
+        postcardId: postcard.id || ""
+      })
+    }).then(function (r) {
+      return r.json().catch(function(){ return {}; }).then(function (data) {
+        if (r.status === 401 && data.needsAuth) {
+          // Do NOT full-page redirect here — signal the caller so it can re-auth
+          // via the popup flow (keeps the GetBirds page loaded).
+          var e = new Error(data.error || "Adobe sign-in required.");
+          e.needsAuth = true;
+          e.authorizeUrl = data.authorizeUrl || "";
+          throw e;
+        }
+        if (!r.ok || !data.ok) throw new Error(data.error || "Could not send media to Adobe.");
+        return data;
+      });
+    });
+  }
+
+  // NOTE: these result/preview windows are intentionally opened WITHOUT
+  // "noopener" — noopener makes window.open() return null, which is what left a
+  // stray about:blank tab behind and blocked reuse. We keep the handle so the
+  // same window can be navigated to the asset preview and closed cleanly.
+  function openFrameioErrorTab() {
+    var url = "https://next.frame.io/project/" + encodeURIComponent(FRAMEIO_PROJECT_ID);
+    var win = null;
+    try { win = window.__firebirdFrameioResultTab || null; } catch (_) {}
+    window.__firebirdFrameioResultTab = null;
+    try { if (win && !win.closed) { win.location.href = url; return true; } } catch (_) {}
+    try { return !!window.open(url, "firebirdFrameioResult"); } catch (_) { return false; }
+  }
+
+  function openFrameioAssetPreview(result) {
+    var url = result && (result.viewUrl || (result.file && (result.file.view_url || result.file.viewUrl)));
+    if (!url) url = "https://next.frame.io/project/" + encodeURIComponent(FRAMEIO_PROJECT_ID);
+    // Reuse the window opened during the click gesture / the auth popup when
+    // available (avoids the pop-up blocker); otherwise fall back to window.open.
+    var win = null;
+    try { win = window.__firebirdFrameioResultTab || null; } catch (_) {}
+    window.__firebirdFrameioResultTab = null;
+    try {
+      if (win && !win.closed) { win.location.href = url; return { url: url, opened: true }; }
+    } catch (_) {}
+    var opened = false;
+    try { opened = !!window.open(url, "firebirdFrameioResult"); } catch (_) { opened = false; }
+    return { url: url, opened: opened };
+  }
+
+  function onFrameioSendSuccess(result, button, mediaKey) {
+    setFrameioAuthed(true); // a successful send proves the server session is live
+    setSendToAdobeButton(button, "sent", "Sent to Adobe ✓");
+    // Record the media as pushed so it can never be re-uploaded (dedupe), and mark
+    // every button for that media across the grid.
+    if (mediaKey) {
+      recordFrameioSent(mediaKey, result && result.viewUrl);
+      markFrameioSentButtons(mediaKey);
+    }
+    var projectName = result.projectName || "Project_FIREBIRD";
+    var dateName = (result && result.dateName) ? (' (' + result.dateName + ')') : "";
+    var already = result && (result.duplicate || result.status === "already-sent");
+    var verb = already ? "Already in " : "Sent to ";
+    var preview = openFrameioAssetPreview(result);
+    if (preview.opened) {
+      setHeaderStatus(verb + projectName + dateName + " — opened the asset preview in Frame.io.", false);
+    } else {
+      // Post-redirect pop-ups can be blocked; surface the exact asset URL so the
+      // uploaded asset is still one click away.
+      setHeaderStatus(verb + projectName + dateName + ". Pop-up blocked — open the asset: " + preview.url, false, { persist: true });
+    }
+  }
+
+  function runFrameioUpload(postcard, media, button, mediaKey) {
+    setSendToAdobeButton(button, "uploading", "Sending…");
+    return sendToFrameio(postcard, media).then(function (result) {
+      onFrameioSendSuccess(result, button, mediaKey);
+    });
+  }
+
+  function frameioAuthPayload(postcard, media) {
+    return JSON.stringify({
+      usage_id: getFrameioUsageId(),
+      mediaUrl: media.url,
+      filename: filenameFromMedia(media),
+      createdAt: postcard.createdAt || "",
+      species: formatSpeciesLabel(postcard),
+      postcardId: postcard.id || ""
+    });
+  }
+
+  // Popup-based Adobe IMS auth — mirrors the smooth "Save to YouTube" (Google
+  // token popup) UX: the GetBirds page is NEVER reloaded, so the feed/state stay
+  // put and the user is not dumped back on the sign-in page. The same popup is
+  // then reused to show the uploaded asset's Frame.io preview.
+  function startAdobeAuthPopup(postcard, media, button, authStartedKey, existingWin, mediaKey) {
+    var popup = (existingWin && !existingWin.closed) ? existingWin : null;
+    if (!popup) {
+      try { popup = window.open("about:blank", "firebirdAdobeLogin", "width=640,height=780,menubar=no,toolbar=no,location=yes"); } catch (_) { popup = null; }
+    }
+    window.__firebirdFrameioResultTab = popup;
+    setSendToAdobeButton(button, "uploading", "Connecting…");
+    setHeaderStatus("Opening Adobe sign-in…", false, { persist: true });
+
+    fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-auth-begin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      body: frameioAuthPayload(postcard, media)
+    }).then(function (r) {
+      return r.json().catch(function(){ return {}; }).then(function (data) {
+        if (!r.ok || !data.ok || !data.authorizeUrl) throw new Error(data.error || "Could not start Adobe IMS authentication.");
+        sessionStorage.setItem(authStartedKey, "1");
+        if (popup && !popup.closed) {
+          popup.location.href = data.authorizeUrl;
+          waitForAdobeAuthMessage(postcard, media, button, popup, authStartedKey, mediaKey);
+        } else {
+          // Popup blocked → fall back to a full-page redirect. The server callback
+          // detects "no opener" and redirects back to ?frameio_resume=1, which
+          // completes the upload on load.
+          window.location.href = data.authorizeUrl;
+        }
+        return null;
+      });
+    }).catch(function (err) {
+      try { if (popup && !popup.closed) popup.close(); } catch (_) {}
+      window.__firebirdFrameioResultTab = null;
+      sessionStorage.removeItem(authStartedKey);
+      setSendToAdobeButton(button, "idle", "Send to Adobe");
+      setHeaderStatus((err && err.message) || "Could not start Adobe IMS authentication.", true);
+    });
+  }
+
+  function waitForAdobeAuthMessage(postcard, media, button, popup, authStartedKey, mediaKey) {
+    var settled = false;
+    var pollTimer = null;
+    function cleanup() {
+      settled = true;
+      window.removeEventListener("message", onMsg);
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+    function onMsg(ev) {
+      if (settled) return;
+      if (ev.origin !== window.location.origin) return;
+      var d = ev.data || {};
+      if (!d || d.type !== "firebird-frameio-auth") return;
+      cleanup();
+      if (!d.ok) {
+        setFrameioAuthed(false);
+        sessionStorage.removeItem(authStartedKey);
+        setSendToAdobeButton(button, "idle", "Send to Adobe");
+        setHeaderStatus(d.error ? ("Adobe sign-in failed: " + d.error) : "Adobe sign-in failed.", true, { persist: true });
+        try { if (popup && !popup.closed) popup.close(); } catch (_) {}
+        window.__firebirdFrameioResultTab = null;
+        return;
+      }
+      // Authenticated inside the popup — this is the single master login. Remember
+      // it so no further Send to Adobe re-prompts, then upload without reloading.
+      setFrameioAuthed(true);
+      setHeaderStatus("Adobe authorized. Uploading the selected media to Frame.io…", false, { persist: true });
+      runFrameioUpload(postcard, media, button, mediaKey).catch(function (err) {
+        setSendToAdobeButton(button, "idle", "Send to Adobe");
+        setHeaderStatus((err && err.message) || "Could not send media to Adobe.", true);
+        openFrameioErrorTab();
+      });
+    }
+    window.addEventListener("message", onMsg);
+    // If the user closes the sign-in window before it finishes, reset cleanly.
+    pollTimer = setInterval(function () {
+      if (settled) { clearInterval(pollTimer); pollTimer = null; return; }
+      if (popup && popup.closed) {
+        cleanup();
+        sessionStorage.removeItem(authStartedKey);
+        setSendToAdobeButton(button, "idle", "Send to Adobe");
+        setHeaderStatus("Adobe sign-in window was closed before finishing.", true);
+        window.__firebirdFrameioResultTab = null;
+      }
+    }, 800);
+  }
+
+  function onSendToAdobe(postcard, media, button) {
+    if (!postcard || !media || !media.url || busy) return;
+
+    // DEDUPE: a media already pushed to Frame.io is never re-uploaded. Re-clicking
+    // just re-opens the existing asset preview.
+    var mediaKey = frameioMediaKey(media);
+    if (mediaKey && isFrameioSent(mediaKey)) {
+      markFrameioSentButtons(mediaKey);
+      var existing = getFrameioSentUrl(mediaKey);
+      if (existing && existing !== "sent") {
+        try { window.open(existing, "firebirdFrameioResult"); } catch (_) {}
+        setHeaderStatus("Already sent to Adobe — reopened the asset preview.", false);
+      } else {
+        setHeaderStatus("This media was already sent to Adobe.", false);
+      }
+      return;
+    }
+
+    var authStartedKey = "firebird_frameio_ims_started_" + getFrameioUsageId();
+
+    // Open ONE window inside the click gesture; it becomes either the Adobe login
+    // popup or the asset-preview tab. (No separate about:blank tab.)
+    var gestureWin = null;
+    try { gestureWin = window.open("about:blank", "firebirdFrameioResult"); } catch (_) { gestureWin = null; }
+    window.__firebirdFrameioResultTab = gestureWin;
+    setSendToAdobeButton(button, "uploading", "Connecting…");
+
+    function loginThenUpload() {
+      startAdobeAuthPopup(postcard, media, button, authStartedKey, gestureWin, mediaKey);
+    }
+    function directUpload() {
+      runFrameioUpload(postcard, media, button, mediaKey).catch(function (err) {
+        if (err && err.needsAuth) {
+          // Server session lapsed — re-auth via popup, reusing the gesture window.
+          setFrameioAuthed(false);
+          sessionStorage.removeItem(authStartedKey);
+          startAdobeAuthPopup(postcard, media, button, authStartedKey, gestureWin, mediaKey);
+          return;
+        }
+        try { if (gestureWin && !gestureWin.closed) gestureWin.close(); } catch (_) {}
+        window.__firebirdFrameioResultTab = null;
+        setSendToAdobeButton(button, "idle", "Send to Adobe");
+        setHeaderStatus((err && err.message) || "Could not send media to Adobe.", true);
+      });
+    }
+
+    // ONE MASTER LOGIN: only prompt Adobe login when the server session is not
+    // already authenticated. If we already know it is (fast-path flag), upload
+    // directly; otherwise confirm with the server before deciding.
+    if (isFrameioAuthedFlag()) {
+      directUpload();
+      return;
+    }
+    frameioStatus().then(function (res) {
+      var ready = res && res.data && (res.data.ready || res.data.authenticated);
+      if (ready) { setFrameioAuthed(true); directUpload(); }
+      else { loginThenUpload(); }
+    }).catch(function () {
+      loginThenUpload();
+    });
+  }
+
+  function resumeFrameioSendAfterIms() {
+    try {
+      var params = new URLSearchParams(window.location.search || "");
+      if (params.get("frameio_resume") !== "1") return Promise.resolve(false);
+    } catch (_) {
+      return Promise.resolve(false);
+    }
+    setHeaderStatus("Adobe authorized. Sending the selected media to Frame.io…", false, { persist: true });
+    return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-resume-send", {
+      method: "POST",
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin",
+      cache: "no-store"
+    }).then(function (r) {
+      return r.json().catch(function(){ return {}; }).then(function (data) {
+        if (!r.ok || !data.ok) throw new Error(data.error || "Could not resume the Frame.io upload.");
+        setFrameioAuthed(true);
+        // No button/mediaKey after a full-page redirect; server-side dedupe still
+        // prevents any re-upload of this media.
+        onFrameioSendSuccess(data, null, "");
+        return true;
+      });
+    });
   }
 
   function getPrimarySpeciesForYouTube(postcard) {
@@ -5036,6 +6551,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     signOut().finally(function () { setBusy(false); });
   });
 
+
   if (youtubeModalClose) {
     youtubeModalClose.addEventListener("click", closeYouTubeUploadModal);
   }
@@ -5084,14 +6600,37 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     });
   }
 
+  try {
+    var authErrorParam = new URLSearchParams(window.location.search || "").get("frameio_auth_error");
+    if (authErrorParam === "1") {
+      fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-status", { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.json().catch(function(){ return {}; }); })
+        .then(function () {
+          setHeaderStatus("Adobe IMS authorization/profile access failed. Sign out of Adobe, disable automatic profile selection if needed, sign in with the profile that has access to Project_FIREBIRD, then retry Send to Adobe. Open https://account.adobe.com/ to manage profiles.", true, {persist:true});
+        });
+    }
+    var connectedParam = new URLSearchParams(window.location.search || "").get("frameio_connected");
+    if (connectedParam === "1") {
+      setHeaderStatus("Adobe IMS connected. Frame.io is ready.", false);
+    }
+  } catch (_) {}
+
   syncGraphqlOverrideFromUrl();
   restoreYouTubeUploadBlockedState();
-
   setBusy(true);
-  restoreSession().then(function (ok) {
-    if (!ok) showLogin();
-  }).catch(function () {
-    showLogin();
+  beginFrameioUsage().catch(function () {}).then(function () {
+    var hasFrameioResume = false;
+    try { hasFrameioResume = new URLSearchParams(window.location.search || '').get('frameio_resume') === '1'; } catch (_) {}
+    if (hasFrameioResume) return resumeFrameioSendAfterIms().then(function () { return true; });
+    return restoreSession();
+  }).then(function (ok) {
+    if (!ok) { showLogin(); return false; }
+    return true;
+  }).catch(function (e) {
+    if (e && e.message) {
+      setHeaderStatus(e.message, true, { persist: true });
+      try { if (new URLSearchParams(window.location.search || "").get("frameio_resume") === "1") openFrameioErrorTab(); } catch (_) {}
+    } else showLogin();
   }).finally(function () { setBusy(false); });
 
   if (document.readyState === "loading") {
