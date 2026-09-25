@@ -11,8 +11,8 @@
  * This file is loaded automatically by gbirds.php when it exists alongside it.
  */
 
-define('FIREBIRD_FRAMEIO_CLIENT_ID', '8675309');
-define('FIREBIRD_FRAMEIO_CLIENT_SECRET', 'flizzle-dorf-makeup-shizzle-here');
+define('FIREBIRD_FRAMEIO_CLIENT_ID', '175eb39cbc7241deb96d16dc07f2673b');
+define('FIREBIRD_FRAMEIO_CLIENT_SECRET', 'p8e-aCzx1McEJ4AdpMbaTll_GPx_iwTsEnf3');
 
 define(
     'FIREBIRD_FRAMEIO_REDIRECT_URI',
@@ -26,7 +26,7 @@ define(
 
 define(
     'FIREBIRD_FRAMEIO_PROJECT_ID',
-    'adobe-mc-dizzle-flizzele'
+    'f7f67254-9ec8-4e2c-99f8-32cd31123eef'
 );
 
 // Upload target collection inside the project. Resolved at runtime by id first,
@@ -38,4 +38,4 @@ define('FIREBIRD_FRAMEIO_COLLECTION_NAME', 'Project_FIREBIRD');
 // Explicit upload base folder — the "BIRDS" folder inside Assets. Takes priority
 // over the collection. Date subfolders (Y-m-d) are created under it. Leave empty
 // to fall back to the collection / project root.
-define('FIREBIRD_FRAMEIO_FOLDER_ID', 'folderid_framee_mc_namee');
+define('FIREBIRD_FRAMEIO_FOLDER_ID', 'a80bef5f-0ec5-4074-b68e-6e70c5f1670f');
