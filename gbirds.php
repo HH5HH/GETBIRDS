@@ -3285,6 +3285,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       <footer id="appFooter" class="app-footer" aria-live="polite">
         <div class="footer-stats" id="footerStats">0 postcards displayed</div>
         <div class="footer-actions" id="footerActions">
+          <button type="button" id="whoDemBtn" class="btn btn-whodat" hidden>WHO DEM?!?</button>
           <button type="button" id="loadMoreBtn" class="load-more" hidden>Load more</button>
           <button type="button" id="loadAllBtn" class="load-more" hidden>Load all postcards</button>
           <button type="button" id="downloadAllMediaBtn" class="btn-mega" hidden>DOWNLOAD ALL MEDIA</button>
@@ -3453,6 +3454,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const mediaStatus = $("mediaStatus");
   const mediaError = $("mediaError");
   const mediaEmpty = $("mediaEmpty");
+  const whoDemBtn = $("whoDemBtn");
   const loadMoreBtn = $("loadMoreBtn");
   const loadAllBtn = $("loadAllBtn");
   const downloadAllBtn = $("downloadAllBtn");
@@ -3777,8 +3779,19 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     onCameraFeedBtn.setAttribute("aria-label", label);
   }
 
+  // WHO DEM?!? is only ever offered when at least one currently-rendered
+  // postcard is still showing its own WHO DAT?!? button (i.e. genuinely
+  // unidentified and eligible) — same eligibility rules as the per-postcard
+  // button, just read back from the DOM rather than re-derived here.
+  function updateWhoDemButtonVisibility() {
+    if (!whoDemBtn) return;
+    var hasUnidentified = !!(mediaGrid && mediaGrid.querySelector('[data-whodat-button="true"]'));
+    whoDemBtn.hidden = !hasUnidentified;
+  }
+
   function updateFooter() {
     updateOnCameraFeedButtonLabel();
+    updateWhoDemButtonVisibility();
     refreshSpeciesFilterBar();
     var visible = getVisibleCounts();
     var total = getDisplayedCounts();
@@ -5130,8 +5143,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
   // The species drill-down (level 2) has no shared "postcard/feed item" id like
   // the normal feed does — every asset is its own CollectionMedia node. Group
-  // them by calendar day so a video + its sibling stills render as ONE card
-  // (same paradigm as the normal feed), instead of one card per individual asset.
+  // them by calendar day (our established create-date grouping paradigm) so
+  // a video + its sibling stills render as ONE postcard, using the same full
+  // postcard-group markup (footer/actions/click-to-viewer) as everywhere else.
   function collectionMediaDateKey(node) {
     var raw = (node && node.media && node.media.createdAt) || (node && node.createdAt) || "";
     var d = new Date(raw);
@@ -5571,14 +5585,14 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     card.setAttribute("tabindex", "0");
     card.setAttribute("aria-label", "Play in TV view");
     card.addEventListener("click", function (ev) {
-      if (ev.target.closest(".media-link")) return;
+      if (ev.target.closest(".media-actions")) return;
       ev.preventDefault();
       var segments = getPostcardSegments(postcard);
       if (segments.length === 0) return;
       openGetBirdsTVWithSegments(segments, mediaIndex);
     });
     card.addEventListener("keydown", function (ev) {
-      if (ev.target.closest(".media-link")) return;
+      if (ev.target.closest(".media-actions")) return;
       if (ev.key !== "Enter" && ev.key !== " ") return;
       ev.preventDefault();
       var segments = getPostcardSegments(postcard);
@@ -5761,10 +5775,11 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     // unidentified bird — the exact case the native app offers "identify" for.
     // Collected/expired items or saved media aren't reanalyzable (BirdBuddy
     // returns an internal error), so don't offer WHO DAT there. Live-capture
-    // postcards are offered it too per product ask, even though there's no
-    // real BirdBuddy feed item behind the synthetic id — it'll just come back
-    // "couldn't identify" via the same error handling as any other miss.
-    if (((feedMode === "inbox" && postcard.itemType === "FeedItemNewPostcard") || postcard.isLiveCapture) && !postcardHasKnownSpecies(postcard)) {
+    // postcards never got a real BirdBuddy feed item at all (they're a local
+    // canvas screenshot of the raw stream, never ingested by BirdBuddy's own
+    // pipeline) — confirmed in practice that reanalyze always comes back
+    // "couldn't identify", so don't offer it there either.
+    if (feedMode === "inbox" && postcard.itemType === "FeedItemNewPostcard" && !postcard.isLiveCapture && !postcardHasKnownSpecies(postcard)) {
       whoDatBtn = document.createElement("button");
       whoDatBtn.type = "button";
       whoDatBtn.className = "btn btn-whodat";
@@ -5777,7 +5792,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
     actions.appendChild(downloadPostcardBtn);
     // My-media view items are already saved — no Save to collection there.
-    if (feedMode === "inbox" || postcard.isLiveCapture) actions.appendChild(saveCollectionBtn);
+    // Live captures have no real BirdBuddy feed item to collect either — same
+    // root cause as WHO DAT above.
+    if (feedMode === "inbox" && !postcard.isLiveCapture) actions.appendChild(saveCollectionBtn);
     if (whoDatBtn) actions.appendChild(whoDatBtn);
     // Live captures are screenshots only (no recorded video) — Save to
     // YouTube has nothing to do there, so skip it entirely rather than show
@@ -6055,8 +6072,16 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return { names: names, known: known };
   }
 
+  // Single-click entry point (respects the global busy flag as its reentrancy
+  // guard). WHO DEM?!? batches call identifyVisitor() directly below, since
+  // the batch itself owns the busy flag for its whole run.
   function onIdentifyVisitor(postcard, button) {
     if (!postcard || !postcard.id || busy) return;
+    return identifyVisitor(postcard, button);
+  }
+
+  function identifyVisitor(postcard, button) {
+    if (!postcard || !postcard.id) return Promise.resolve();
     var feedItemId = String(postcard.id);
     var original = button ? button.textContent : "";
     if (button) { button.disabled = true; button.textContent = "Identifying…"; button.classList.add("uploading"); }
@@ -6085,7 +6110,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       });
     }
 
-    getValidBbToken()
+    return getValidBbToken()
       .then(runReanalyze)
       .catch(function (e) {
         if (e && e.isAuthError) { clearBirdBuddyTokens(); return getValidBbToken().then(runReanalyze); }
@@ -6134,6 +6159,60 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
           finish(raw, true);
         }
       });
+  }
+
+  function findPostcardById(id) {
+    for (var i = 0; i < allPostcards.length; i++) {
+      if (allPostcards[i] && allPostcards[i].id === id) return allPostcards[i];
+    }
+    return null;
+  }
+
+  // WHO DEM?!? — batch-run WHO DAT?!? top to bottom over every currently
+  // unidentified postcard. Staggered (one at a time, each awaited before the
+  // next fires) rather than parallel, matching the "identifying, please
+  // wait" single-flight feel the per-postcard button already has. It's a
+  // coin flip whether any given one actually gets identified — that's normal,
+  // not an error, so a postcard staying "Unknown Birdo" isn't treated as a
+  // failure.
+  function runWhoDemBatch() {
+    if (busy || !whoDemBtn) return;
+    var buttons = mediaGrid ? mediaGrid.querySelectorAll('[data-whodat-button="true"]') : [];
+    var total = buttons.length;
+    if (total === 0) return;
+
+    setBusy(true);
+    whoDemBtn.hidden = true;
+    loadMoreBtn.hidden = true;
+    loadAllBtn.hidden = true;
+    mediaError.hidden = true;
+    mediaStatus.hidden = false;
+
+    var done = 0;
+    function next() {
+      // Re-query each pass: a successful identify removes its own button from
+      // the DOM, and the set can shift as the grid updates.
+      var remaining = mediaGrid.querySelectorAll('[data-whodat-button="true"]');
+      if (!remaining.length) {
+        mediaStatus.hidden = true;
+        setBusy(false);
+        updateFooter();
+        setHeaderStatus("WHO DEM?!? Checked " + total + " mystery visitor" + (total === 1 ? "" : "s") + ".", false);
+        return;
+      }
+      done += 1;
+      mediaStatus.textContent = "WHO DEM?!? Identifying mystery visitor " + done + " of " + total + "…";
+      var btn = remaining[0];
+      var postcard = findPostcardById(btn.dataset.postcardId || "");
+      if (!postcard) {
+        // No matching postcard (shouldn't happen) — drop the stale button and move on.
+        btn.removeAttribute("data-whodat-button");
+        next();
+        return;
+      }
+      identifyVisitor(postcard, btn).then(next);
+    }
+    next();
   }
 
   function onSaveToCollection(postcard, button) {
@@ -8642,6 +8721,10 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   });
 
   loadAllBtn.addEventListener("click", loadAllPostcards);
+
+  if (whoDemBtn) {
+    whoDemBtn.addEventListener("click", runWhoDemBatch);
+  }
 
   if (downloadAllBtn) {
     downloadAllBtn.addEventListener("click", function () { onDownloadAllClick(); });
