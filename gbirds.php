@@ -3012,6 +3012,49 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     .getbirds-tv-livemsg .livemsg-sub { font-size: 0.95rem; color: #b6b8bd; }
     .getbirds-tv-livemsg.hidden { display: none !important; }
 
+    /* FireBird spinner — a phoenix riding an animated fire/rainbow trail,
+       shown while the carousel's batch "Send to Adobe" is in flight. */
+    .firebird-spinner {
+      position: relative;
+      width: 260px;
+      max-width: 80vw;
+      height: 64px;
+      margin: 0 auto 0.5rem;
+    }
+    .firebird-trail {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      right: 0;
+      height: 10px;
+      transform: translateY(-50%);
+      border-radius: 999px;
+      background: linear-gradient(90deg,
+        #ff3b30, #ff9500, #ffe000, #34c759, #32ade6, #5e5ce6, #ff2d92,
+        #ff3b30, #ff9500, #ffe000, #34c759, #32ade6, #5e5ce6, #ff2d92);
+      background-size: 200% 100%;
+      animation: firebirdTrailShift 1.1s linear infinite;
+      box-shadow: 0 0 14px rgba(255,140,0,0.65);
+    }
+    @keyframes firebirdTrailShift {
+      from { background-position: 0% 0; }
+      to { background-position: -100% 0; }
+    }
+    .firebird-emoji {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      font-size: 2.4rem;
+      line-height: 1;
+      transform: translate(-50%, -55%) rotate(-4deg);
+      animation: firebirdBob 0.6s ease-in-out infinite alternate;
+      filter: drop-shadow(0 0 8px rgba(255,140,0,0.8));
+    }
+    @keyframes firebirdBob {
+      from { transform: translate(-50%, -58%) rotate(-6deg); }
+      to { transform: translate(-50%, -45%) rotate(6deg); }
+    }
+
     .getbirds-tv-overlay {
       position: fixed;
       inset: 0;
@@ -3216,6 +3259,67 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
     .getbirds-tv-unmute:hover { background: rgba(0,0,0,0.75); color: #fff; }
     .getbirds-tv-unmute.muted { opacity: 0.7; }
+
+    /* Bulk "Send to Adobe" — a subtle per-frame checkbox that adds the
+       currently-shown asset to a batch, plus a button (shown once >=1 asset
+       is selected) that fires the whole batch in one go. */
+    .getbirds-tv-select {
+      position: absolute;
+      bottom: 0.75rem;
+      right: 0.75rem;
+      z-index: 8;
+      width: 1.7rem;
+      height: 1.7rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.45);
+      border-radius: 6px;
+      cursor: pointer;
+      opacity: 0.5;
+      transition: opacity 0.15s ease;
+      pointer-events: auto;
+    }
+    .getbirds-tv-select:hover, .getbirds-tv-select.is-checked { opacity: 1; }
+    .getbirds-tv-select input[type="checkbox"] {
+      width: 1.1rem;
+      height: 1.1rem;
+      accent-color: var(--accent, #4c8bf5);
+      cursor: pointer;
+    }
+    .getbirds-tv-send-batch {
+      position: absolute;
+      top: 1rem;
+      left: 6rem;
+      z-index: 10;
+      width: 2.5rem;
+      height: 2.5rem;
+      padding: 0;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      cursor: pointer;
+      pointer-events: auto;
+    }
+    .getbirds-tv-send-batch:hover { background: rgba(0,0,0,0.75); color: #fff; }
+    .getbirds-tv-send-batch[disabled] { opacity: 0.6; cursor: default; }
+    .getbirds-tv-send-batch svg { display: block; margin: 0 auto; }
+    .getbirds-tv-send-batch-count {
+      position: absolute;
+      top: -0.3rem;
+      right: -0.3rem;
+      min-width: 1.15rem;
+      height: 1.15rem;
+      padding: 0 0.25rem;
+      border-radius: 999px;
+      background: #c8322b;
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      line-height: 1.15rem;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -3317,6 +3421,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         <video id="getbirdsTvVideo" class="getbirds-tv-video" autoplay playsinline></video>
         <img id="getbirdsTvImage" class="getbirds-tv-image hidden" alt="" />
         <div id="getbirdsTvLiveMsg" class="getbirds-tv-livemsg hidden" role="status" aria-live="polite"></div>
+        <label id="getbirdsTvSelectWrap" class="getbirds-tv-select" title="Add to Send to Adobe batch">
+          <input type="checkbox" id="getbirdsTvSelectCheckbox" aria-label="Add this asset to the Send to Adobe batch" />
+        </label>
       </div>
       <div id="getbirdsTvNextPanel" class="getbirds-tv-panel getbirds-tv-next" aria-label="Play next" role="button" tabindex="0"></div>
     </div>
@@ -3330,6 +3437,10 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     <button type="button" id="getbirdsTvDownload" class="getbirds-tv-download" aria-label="Download" title="Download" style="display: none;">↓</button>
     <button type="button" id="getbirdsTvCapture" class="getbirds-tv-capture" aria-label="Save this live frame" title="Save this live frame" style="display: none;">📷</button>
     <button type="button" id="getbirdsTvUnmute" class="getbirds-tv-unmute" aria-label="Unmute">🔊</button>
+    <button type="button" id="getbirdsTvSendBatch" class="getbirds-tv-send-batch" aria-label="Send selected assets to Adobe" title="Send selected assets to Adobe" style="display: none;">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 16V8m0 0l-3.2 3.2M12 8l3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="getbirds-tv-send-batch-count" id="getbirdsTvSendBatchCount">0</span>
+    </button>
     <button type="button" id="getbirdsTvClose" class="getbirds-tv-close" aria-label="Close GetBirds.TV">×</button>
   </div>
 
@@ -3483,6 +3594,10 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const getbirdsTvUnmute = $("getbirdsTvUnmute");
   const getbirdsTvDownload = $("getbirdsTvDownload");
   const getbirdsTvCapture = $("getbirdsTvCapture");
+  const getbirdsTvSelectWrap = $("getbirdsTvSelectWrap");
+  const getbirdsTvSelectCheckbox = $("getbirdsTvSelectCheckbox");
+  const getbirdsTvSendBatch = $("getbirdsTvSendBatch");
+  const getbirdsTvSendBatchCount = $("getbirdsTvSendBatchCount");
   const getbirdsTvLowerThird = $("getbirdsTvLowerThird");
   const getbirdsTvSnipe = $("getbirdsTvSnipe");
 
@@ -6612,6 +6727,40 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   // A locally-captured live frame has no BirdBuddy CDN url — nothing for the
   // server to remote_upload from — so it goes through a dedicated endpoint
   // that uploads the raw bytes directly to Frame.io instead.
+  // Bare network call for a locally-captured (GO LIVE) frame — no button/
+  // gesture-window UI, just POST the blob and resolve with the result JSON.
+  // Shared by the single-click flow above and the carousel batch sender.
+  function sendLocalCaptureToFrameio(postcard, media) {
+    var meta = buildFrameioMetadata(postcard, media);
+    var name = "live_frame_" + (media.id || Date.now()) + ".jpg";
+    var fd = new FormData();
+    fd.append("file", media.blob, name);
+    fd.append("filename", name);
+    fd.append("createdAt", media.capturedAt || new Date().toISOString());
+    fd.append("species", formatSpeciesLabel(postcard));
+    fd.append("postcardId", postcard.id || "");
+    fd.append("description", meta.description);
+    fd.append("metadata", JSON.stringify(meta.fields));
+    return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-send-local", {
+      method: "POST",
+      credentials: "same-origin",
+      body: fd
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (data) {
+        if (!r.ok || !data.ok) throw new Error(data.error || "Could not send the live frame to Adobe.");
+        return data;
+      });
+    });
+  }
+
+  // A single network call for ANY media (URL-based BirdBuddy postcard media,
+  // or a local GO LIVE capture) — no per-button UI, just resolves with the
+  // Frame.io response. Used by the carousel's batch sender.
+  function sendMediaToFrameioBare(postcard, media) {
+    if (media && media.isLocalCapture) return sendLocalCaptureToFrameio(postcard, media);
+    return sendToFrameio(postcard, media);
+  }
+
   function onSendLocalCaptureToAdobe(postcard, media, button) {
     if (!postcard || !media || !media.blob || busy) return;
 
@@ -6642,26 +6791,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
     function doUpload() {
       setSendToAdobeButton(button, "uploading", "Uploading…");
-      var meta = buildFrameioMetadata(postcard, media);
-      var name = "live_frame_" + (media.id || Date.now()) + ".jpg";
-      var fd = new FormData();
-      fd.append("file", media.blob, name);
-      fd.append("filename", name);
-      fd.append("createdAt", media.capturedAt || new Date().toISOString());
-      fd.append("species", formatSpeciesLabel(postcard));
-      fd.append("postcardId", postcard.id || "");
-      fd.append("description", meta.description);
-      fd.append("metadata", JSON.stringify(meta.fields));
-      return fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-send-local", {
-        method: "POST",
-        credentials: "same-origin",
-        body: fd
-      }).then(function (r) {
-        return r.json().catch(function () { return {}; }).then(function (data) {
-          if (!r.ok || !data.ok) throw new Error(data.error || "Could not send the live frame to Adobe.");
-          return data;
-        });
-      });
+      return sendLocalCaptureToFrameio(postcard, media);
     }
 
     function run() {
@@ -7987,7 +8117,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         createdAt: createdAt,
         firstImageUrl: panelImageUrl || firstImageUrl,
         downloadName: filenameFromMedia(m),
-        postcardId: postcardId
+        postcardId: postcardId,
+        postcard: postcard,
+        media: m
       });
     });
     return segments;
@@ -8002,25 +8134,26 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       var postcardId = group.getAttribute("data-postcard-id") || "";
       var species = (group.getAttribute("data-species") || "").trim() || "—";
       var postcard = allPostcards.filter(function (p) { return (p.id || "") === postcardId; })[0];
-      var createdAt = postcard && postcard.createdAt ? formatPostcardDate(postcard.createdAt) : "—";
+      if (!postcard || !Array.isArray(postcard.medias)) return;
+      var createdAt = postcard.createdAt ? formatPostcardDate(postcard.createdAt) : "—";
       var firstImageUrl = getFirstPostcardImageUrl(postcard);
-      var links = group.querySelectorAll(".media-link");
-      for (var i = 0; i < links.length; i++) {
-        var a = links[i];
-        var name = (a.getAttribute("data-download-name") || a.getAttribute("download") || "").toLowerCase();
-        if (!/\.(mp4|webm|mov)$/.test(name)) continue;
-        var url = a.getAttribute("data-media-url") || a.href || "";
-        if (!url) continue;
+      // Walk the postcard's own media list (not the DOM) so each segment can
+      // carry the real postcard/media object references — needed for the
+      // carousel's batch "Send to Adobe".
+      postcard.medias.forEach(function (m) {
+        if (!m || !m.isVideo || !m.url) return;
         segments.push({
-          url: url,
+          url: m.url,
           isVideo: true,
           postcardId: postcardId,
           species: species,
           createdAt: createdAt,
           firstImageUrl: firstImageUrl,
-          downloadName: a.getAttribute("data-download-name") || a.getAttribute("download") || ""
+          downloadName: filenameFromMedia(m),
+          postcard: postcard,
+          media: m
         });
-      }
+      });
     });
     return segments;
   }
@@ -8029,6 +8162,31 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   var getbirdsTvIndex = 0;
   var getbirdsTvKeyHandler = null;
   var getbirdsTvEscapeHandler = null;
+
+  // Bulk "Send to Adobe" — indices (into getbirdsTvSegments) the user has
+  // checked while browsing the carousel. Reset whenever a fresh set of
+  // segments opens, or the overlay is closed.
+  var getbirdsTvBatchSet = new Set();
+
+  function updateGetBirdsTvSelectUi() {
+    if (!getbirdsTvSelectCheckbox || !getbirdsTvSelectWrap) return;
+    var checked = getbirdsTvBatchSet.has(getbirdsTvIndex);
+    getbirdsTvSelectCheckbox.checked = checked;
+    getbirdsTvSelectWrap.classList.toggle("is-checked", checked);
+  }
+
+  function updateGetBirdsTvSendBatchUi() {
+    if (!getbirdsTvSendBatch) return;
+    var count = getbirdsTvBatchSet.size;
+    getbirdsTvSendBatch.style.display = count > 0 ? "" : "none";
+    if (getbirdsTvSendBatchCount) getbirdsTvSendBatchCount.textContent = String(count);
+  }
+
+  function resetGetBirdsTvBatchSelection() {
+    getbirdsTvBatchSet.clear();
+    updateGetBirdsTvSelectUi();
+    updateGetBirdsTvSendBatchUi();
+  }
 
   function playGetBirdsTvSegmentAtIndex(index) {
     if (getbirdsTvSegments.length === 0) return;
@@ -8064,6 +8222,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     updateGetBirdsTvDownloadButton(segment);
     updateGetBirdsTvUnmuteButton();
     if (getbirdsTvUnmute) getbirdsTvUnmute.style.display = isVideo ? "" : "none";
+    updateGetBirdsTvSelectUi();
   }
 
   function updateGetBirdsTvOverlays(segment) {
@@ -8112,6 +8271,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     if (!getbirdsTvOverlay) return;
     getbirdsTvSegments = segments;
     getbirdsTvIndex = typeof startIndex === "number" ? startIndex : 0;
+    resetGetBirdsTvBatchSelection();
     getbirdsTvOverlay.classList.remove("hidden");
     if (!getbirdsTvEscapeHandler) {
       getbirdsTvEscapeHandler = function (e) {
@@ -8307,6 +8467,44 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     getbirdsTvLiveMsg.classList.remove("hidden");
   }
   function hideLiveMessage() { if (getbirdsTvLiveMsg) getbirdsTvLiveMsg.classList.add("hidden"); }
+
+  // FireBird spinner for the carousel's batch "Send to Adobe" — a phoenix
+  // riding an animated fire/rainbow trail (Nyan Cat spirit, original artwork).
+  function showFirebirdSendingMessage(sub) {
+    if (!getbirdsTvLiveMsg) return;
+    getbirdsTvLiveMsg.innerHTML = "";
+    var spinner = document.createElement("div");
+    spinner.className = "firebird-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    var trail = document.createElement("div");
+    trail.className = "firebird-trail";
+    var bird = document.createElement("div");
+    bird.className = "firebird-emoji";
+    // Original spread-wing silhouette (single beak, forked tail) — inspired by
+    // the classic thunderbird/firebird emblem shape, not a copy of any
+    // specific trademarked artwork.
+    bird.innerHTML = '<svg viewBox="0 0 200 100" width="72" height="36" aria-hidden="true">' +
+      '<defs><linearGradient id="firebirdGrad" x1="0" y1="0" x2="1" y2="1">' +
+      '<stop offset="0%" stop-color="#ffe14d"/><stop offset="50%" stop-color="#ff8a1a"/><stop offset="100%" stop-color="#ff3b30"/>' +
+      '</linearGradient></defs>' +
+      '<path fill="url(#firebirdGrad)" stroke="#fff4d6" stroke-width="1.5" stroke-linejoin="round" ' +
+      'd="M100,6 L110,16 L145,20 L104,24 L100,30 L196,42 L185,50 L170,46 L160,58 L150,50 L140,60 L130,52 L120,62 L112,54 L104,64 L118,96 L100,78 L82,96 L96,64 L88,54 L80,62 L70,52 L60,60 L50,50 L40,58 L30,46 L15,50 L4,42 L100,30 L90,16 Z"/>' +
+      '</svg>';
+    spinner.appendChild(trail);
+    spinner.appendChild(bird);
+    getbirdsTvLiveMsg.appendChild(spinner);
+    var t = document.createElement("div");
+    t.className = "livemsg-title";
+    t.textContent = "Sending to Adobe…";
+    getbirdsTvLiveMsg.appendChild(t);
+    if (sub) {
+      var s = document.createElement("div");
+      s.className = "livemsg-sub";
+      s.textContent = sub;
+      getbirdsTvLiveMsg.appendChild(s);
+    }
+    getbirdsTvLiveMsg.classList.remove("hidden");
+  }
 
   function loadHlsJs() {
     if (window.Hls) return Promise.resolve(window.Hls);
@@ -8593,6 +8791,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
 
   function closeGetBirdsTV() {
+    resetGetBirdsTvBatchSelection();
     if (getbirdsLiveActive) stopLiveWatch();
     if (getbirdsTvKeyHandler) {
       document.removeEventListener("keydown", getbirdsTvKeyHandler);
@@ -8621,6 +8820,82 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
     if (getbirdsTvUnmute) getbirdsTvUnmute.style.display = "";
     getbirdsTvSegments = [];
+  }
+
+  // Bulk "Send to Adobe" from the carousel — sends every checked asset one at
+  // a time (each awaited before the next fires, same staggering as WHO DEM?!?),
+  // then closes the overlay and opens the Frame.io project root in a new tab
+  // (there's no single "the" asset to preview once several went up at once).
+  function runGetBirdsTvSendBatch() {
+    if (busy || getbirdsTvBatchSet.size === 0) return;
+    var indexes = Array.from(getbirdsTvBatchSet).sort(function (a, b) { return a - b; });
+    var items = indexes.map(function (i) { return getbirdsTvSegments[i]; }).filter(function (seg) { return seg && seg.postcard && seg.media; });
+    if (!items.length) return;
+
+    function proceed() {
+      setBusy(true);
+      if (getbirdsTvVideo) getbirdsTvVideo.pause();
+      if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = true;
+      if (getbirdsTvClose) getbirdsTvClose.disabled = true;
+      var total = items.length;
+      var sentCount = 0, skippedCount = 0, failedCount = 0;
+      var lastProjectId = "", lastFolderId = "";
+
+      function next(i) {
+        if (i >= items.length) return Promise.resolve();
+        var seg = items[i];
+        showFirebirdSendingMessage("Asset " + (i + 1) + " of " + total + "…");
+        var mediaKey = frameioMediaKey(seg.media);
+        if (mediaKey && isFrameioSent(mediaKey)) {
+          skippedCount += 1;
+          return next(i + 1);
+        }
+        return sendMediaToFrameioBare(seg.postcard, seg.media).then(function (result) {
+          sentCount += 1;
+          if (result && result.folderId) { lastProjectId = result.projectId || lastProjectId; lastFolderId = result.folderId; }
+          if (mediaKey) {
+            recordFrameioSent(mediaKey, result && result.viewUrl);
+            markFrameioSentButtons(mediaKey);
+          }
+          return next(i + 1);
+        }).catch(function () {
+          failedCount += 1;
+          return next(i + 1);
+        });
+      }
+
+      next(0).then(function () {
+        if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = false;
+        if (getbirdsTvClose) getbirdsTvClose.disabled = false;
+        hideLiveMessage();
+        closeGetBirdsTV();
+        setBusy(false);
+        setFrameioAuthed(true);
+        // Open the actual destination folder the batch landed in, not the bare
+        // project root — falls back to the root only if nothing in the batch
+        // actually reported a folder (e.g. everything was skipped/failed).
+        var folderUrl = "https://next.frame.io/project/" + encodeURIComponent(lastProjectId || FRAMEIO_PROJECT_ID) +
+          (lastFolderId ? "/" + encodeURIComponent(lastFolderId) : "");
+        try { window.open(folderUrl, "_blank"); } catch (_) {}
+        var msg = "Sent " + sentCount + " asset" + (sentCount === 1 ? "" : "s") + " to Adobe";
+        if (skippedCount) msg += " (" + skippedCount + " already sent)";
+        if (failedCount) msg += " — " + failedCount + " failed";
+        msg += ".";
+        setHeaderStatus(msg, failedCount > 0);
+      });
+    }
+
+    // Batch mode requires an existing Frame.io session already — juggling the
+    // popup-based re-auth dance across N sequential uploads would be fragile,
+    // same reasoning as local-capture sends.
+    if (isFrameioAuthedFlag()) { proceed(); return; }
+    frameioStatus().then(function (res) {
+      var ready = res && res.data && (res.data.ready || res.data.authenticated);
+      if (ready) { setFrameioAuthed(true); proceed(); }
+      else showLiveMessage("🔒", "Sign in to Adobe first", "Use Send to Adobe on any single postcard from the grid, then try this batch again.");
+    }).catch(function () {
+      showLiveMessage("🔒", "Sign in to Adobe first", "Use Send to Adobe on any single postcard from the grid, then try this batch again.");
+    });
   }
 
   function getTokenClient() {
@@ -8767,6 +9042,18 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
   if (getbirdsTvClose) {
     getbirdsTvClose.addEventListener("click", closeGetBirdsTV);
+  }
+  if (getbirdsTvSelectCheckbox && getbirdsTvSelectWrap) {
+    getbirdsTvSelectWrap.addEventListener("click", function (ev) { ev.stopPropagation(); });
+    getbirdsTvSelectCheckbox.addEventListener("change", function () {
+      if (getbirdsTvSelectCheckbox.checked) getbirdsTvBatchSet.add(getbirdsTvIndex);
+      else getbirdsTvBatchSet.delete(getbirdsTvIndex);
+      updateGetBirdsTvSelectUi();
+      updateGetBirdsTvSendBatchUi();
+    });
+  }
+  if (getbirdsTvSendBatch) {
+    getbirdsTvSendBatch.addEventListener("click", runGetBirdsTvSendBatch);
   }
   if (getbirdsTvPrevPanel) {
     getbirdsTvPrevPanel.addEventListener("click", function () {

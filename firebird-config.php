@@ -11,8 +11,11 @@
  * This file is loaded automatically by gbirds.php when it exists alongside it.
  */
 
-define('FIREBIRD_FRAMEIO_CLIENT_ID', '175eb39cbc7241deb96d16dc07f2673b');
-define('FIREBIRD_FRAMEIO_CLIENT_SECRET', 'p8e-aCzx1McEJ4AdpMbaTll_GPx_iwTsEnf3');
+define('FIREBIRD_FRAMEIO_CLIENT_ID', '0101010101');
+define('FIREBIRD_FRAMEIO_CLIENT_SECRET', '101010101');
+
+define('PBIRDS_EXPRESS_CLIENT_ID', '10101010101');
+define('PBIRDS_EXPRESS_CLIENT_SECRET', '01010101');
 
 define(
     'FIREBIRD_FRAMEIO_REDIRECT_URI',
@@ -26,7 +29,7 @@ define(
 
 define(
     'FIREBIRD_FRAMEIO_PROJECT_ID',
-    'f7f67254-9ec8-4e2c-99f8-32cd31123eef'
+    'flibery-ziberty-miberty'
 );
 
 // Upload target collection inside the project. Resolved at runtime by id first,
@@ -38,4 +41,4 @@ define('FIREBIRD_FRAMEIO_COLLECTION_NAME', 'Project_FIREBIRD');
 // Explicit upload base folder — the "BIRDS" folder inside Assets. Takes priority
 // over the collection. Date subfolders (Y-m-d) are created under it. Leave empty
 // to fall back to the collection / project root.
-define('FIREBIRD_FRAMEIO_FOLDER_ID', 'a80bef5f-0ec5-4074-b68e-6e70c5f1670f');
+define('FIREBIRD_FRAMEIO_FOLDER_ID', '010101010101010101010101010');
