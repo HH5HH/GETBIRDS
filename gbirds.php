@@ -49,6 +49,18 @@ function gbirds_require_curl(): void {
     }
 }
 
+const GBIRDS_REMOTE_USER_AGENT = 'GetBirds/2026.10 (HH5HH BirdBrains; https://hh5hh.com/gbirds.php)';
+const GBIRDS_REMOTE_CLIENT = 'GetBirds by HH5HH';
+
+function gbirds_remote_headers(array $extra = []): array {
+    return array_merge([
+        'User-Agent: ' . GBIRDS_REMOTE_USER_AGENT,
+        'X-GetBirds-Client: ' . GBIRDS_REMOTE_CLIENT,
+        'X-GetBirds-Purpose: Personal BirdBuddy user app',
+        'Referer: https://hh5hh.com/gbirds.php',
+    ], $extra);
+}
+
 function gbirds_forward_headers(array $extra = []): array {
     $headers = ['Accept: application/json'];
     $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
@@ -86,7 +98,7 @@ function gbirds_forward_headers(array $extra = []): array {
     if ($authorization !== '') {
         $headers[] = 'Authorization: ' . $authorization;
     }
-    return array_merge($headers, $extra);
+    return gbirds_remote_headers(array_merge($headers, $extra));
 }
 
 function gbirds_proxy_graphql(): void {
@@ -198,6 +210,150 @@ function gbirds_proxy_media(): void {
  * are delivered from AWS (CloudFront / MediaPackage / IVS) and mybirdbuddy.com.
  * Suffix-locked to prevent this from becoming an open proxy (SSRF guard).
  */
+function gbirds_proxy_birdbuddy_assets_xml(): void {
+    gbirds_cors_headers();
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') { http_response_code(204); exit; }
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        http_response_code(405);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Method not allowed.';
+        exit;
+    }
+    gbirds_require_curl();
+
+    $assetBase = 'https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com/';
+    $marker = (string)($_GET['marker'] ?? $_GET['start_after'] ?? '');
+    // Match the browser-visible BirdBuddy bucket GET exactly for page 1.
+    // Subsequent pages use the S3 V1 marker returned by the last <Key>.
+    $url = $assetBase;
+    if ($marker !== '') {
+        $url .= '?marker=' . rawurlencode($marker) . '&max-keys=1000';
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => gbirds_remote_headers(['Accept: application/xml,text/xml;q=0.9,*/*;q=0.8']),
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        http_response_code(502);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'BirdBuddy asset bucket request failed: ' . $error;
+        exit;
+    }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $body = substr($raw, $headerSize);
+    curl_close($ch);
+
+    http_response_code($status ?: 502);
+    header('Content-Type: application/xml; charset=utf-8');
+    header('Cache-Control: no-store, max-age=0');
+    header('X-GetBirds-Remote-Source: BirdBuddy-Assets-Bucket');
+    echo $body;
+    exit;
+}
+
+function gbirds_proxy_birdbuddy_asset_download(): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') {
+        http_response_code(405);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Method not allowed.';
+        exit;
+    }
+    gbirds_require_curl();
+    $key = trim((string)($_GET['key'] ?? ''));
+    if ($key === '' || strpos($key, '..') !== false || str_starts_with($key, '/') || !preg_match('#^asset/[A-Za-z0-9._()=+\-/% ]+$#', $key)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Invalid BirdBuddy asset key.';
+        exit;
+    }
+    $url = 'https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com/' . implode('/', array_map('rawurlencode', explode('/', $key)));
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => gbirds_remote_headers(['Accept: */*']),
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        http_response_code(502);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'BirdBuddy asset download failed: ' . $error;
+        exit;
+    }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $headers = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    $contentType = 'application/octet-stream';
+    if (preg_match('/^Content-Type:\s*([^\r\n]+)/im', $headers, $m)) $contentType = trim($m[1]);
+    curl_close($ch);
+    http_response_code($status ?: 502);
+    header('Content-Type: ' . $contentType);
+    header('Content-Length: ' . strlen($body));
+    header('Content-Disposition: attachment; filename="' . addcslashes(basename($key), '"\\') . '"');
+    header('Cache-Control: private, max-age=300');
+    header('X-GetBirds-Remote-Source: BirdBuddy-Assets-Bucket');
+    echo $body;
+    exit;
+}
+
+function gbirds_proxy_birdbuddy_assets(): void {
+    gbirds_cors_headers();
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') { http_response_code(204); exit; }
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') gbirds_json_response(['error' => 'Method not allowed.'], 405);
+    gbirds_require_curl();
+
+    $assetBase = 'https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com/';
+    $maxKeys = (int)($_GET['max_keys'] ?? 1000);
+    $maxKeys = max(1, min($maxKeys, 1000));
+    $params = ['list-type' => '2', 'max-keys' => (string)$maxKeys];
+    $prefix = trim((string)($_GET['prefix'] ?? ''));
+    $continuation = trim((string)($_GET['continuation_token'] ?? ''));
+    $startAfter = trim((string)($_GET['start_after'] ?? ''));
+    if ($prefix !== '') $params['prefix'] = $prefix;
+    if ($continuation !== '') $params['continuation-token'] = $continuation;
+    if ($startAfter !== '') $params['start-after'] = $startAfter;
+    $url = $assetBase . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => gbirds_remote_headers(['Accept: application/xml,text/xml;q=0.9,*/*;q=0.8']),
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) { $error = curl_error($ch); curl_close($ch); gbirds_json_response(['error'=>'BirdBuddy asset manifest request failed.','detail'=>$error],502); }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    $body = substr($raw, $headerSize);
+    curl_close($ch);
+    if ($status < 200 || $status >= 300) gbirds_json_response(['error'=>'BirdBuddy asset manifest request failed ('.$status.').','status'=>$status], $status ?: 502);
+    $keys = [];
+    if (preg_match_all('/<Key>(.*?)<\\/Key>/s', $body, $m)) foreach ($m[1] as $key) $keys[] = html_entity_decode($key, ENT_QUOTES | ENT_XML1, 'UTF-8');
+    $isTruncated = false;
+    if (preg_match('/<IsTruncated>(true|false)<\\/IsTruncated>/i', $body, $m)) $isTruncated = strtolower($m[1]) === 'true';
+    $nextToken = '';
+    if (preg_match('/<NextContinuationToken>(.*?)<\\/NextContinuationToken>/s', $body, $m)) $nextToken = html_entity_decode($m[1], ENT_QUOTES | ENT_XML1, 'UTF-8');
+    gbirds_json_response(['ok'=>true,'source'=>$assetBase,'client'=>GBIRDS_REMOTE_CLIENT,'count'=>count($keys),'keys'=>$keys,'isTruncated'=>$isTruncated,'nextContinuationToken'=>$nextToken,'retrievedAt'=>gmdate('c')]);
+}
+
 function gbirds_allowed_hls_host(string $host): bool {
     $host = strtolower(trim($host));
     if ($host === '') return false;
@@ -380,7 +536,7 @@ function gbirds_frameio_config(): array {
 // Bump this whenever gbirds.php is redeployed so ?api=frameio-status confirms the
 // LIVE server is running the intended build (guards against stale uploads).
 if (!defined('FIREBIRD_BUILD_VERSION')) {
-    define('FIREBIRD_BUILD_VERSION', 'firebird-2026-09-25-status-slug-dbg-14');
+    define('FIREBIRD_BUILD_VERSION', 'firebird-2026-10-02-local-upload-307-response');
 }
 
 function gbirds_session_start(): void {
@@ -401,42 +557,78 @@ function gbirds_session_start(): void {
 
 function gbirds_frameio_http(string $method, string $url, ?array $body, string $accessToken, array $extraHeaders = []): array {
     gbirds_require_curl();
-    $headers = [
+    $headers = gbirds_remote_headers([
         'Authorization: Bearer ' . $accessToken,
         'Accept: application/json',
-    ];
+    ]);
     if ($body !== null) {
         $headers[] = 'Content-Type: application/json';
     }
     foreach ($extraHeaders as $h) { $headers[] = $h; }
-    $ch = curl_init($url);
-    $opts = [
-        CURLOPT_CUSTOMREQUEST => strtoupper($method),
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HEADER => true,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 60,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_HTTPHEADER => $headers,
-    ];
-    if ($body !== null) { $opts[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_SLASHES); }
-    curl_setopt_array($ch, $opts);
-    $raw = curl_exec($ch);
-    if ($raw === false) { $err = curl_error($ch); curl_close($ch); throw new RuntimeException('Frame.io request failed: ' . $err); }
-    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $responseBody = substr($raw, $headerSize);
-    curl_close($ch);
-    $decoded = json_decode($responseBody, true);
-    if (!is_array($decoded)) {
-        $decoded = ['raw' => trim(substr($responseBody, 0, 2000))];
-    } else {
-        $decoded['_http_status'] = $status;
-        if (isset($responseBody[0]) && !isset($decoded['_raw'])) {
-            $decoded['_raw'] = trim(substr($responseBody, 0, 2000));
+
+    $currentUrl = trim($url);
+    $maxRedirects = 3;
+    for ($redirect = 0; $redirect <= $maxRedirects; $redirect++) {
+        $ch = curl_init($currentUrl);
+        $opts = [
+            CURLOPT_CUSTOMREQUEST => strtoupper($method),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER => true,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 60,
+            // Keep redirects manual so a bad API redirect can never send the
+            // bearer token to an unrelated host.  307/308 preserve method/body.
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HTTPHEADER => $headers,
+        ];
+        if ($body !== null) { $opts[CURLOPT_POSTFIELDS] = json_encode($body, JSON_UNESCAPED_SLASHES); }
+        curl_setopt_array($ch, $opts);
+        $raw = curl_exec($ch);
+        if ($raw === false) { $err = curl_error($ch); curl_close($ch); throw new RuntimeException('Frame.io request failed: ' . $err); }
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = (int)curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        $responseHeaders = substr($raw, 0, $headerSize);
+        $responseBody = substr($raw, $headerSize);
+        curl_close($ch);
+
+        // Frame.io occasionally canonicalizes API paths with a 307/308 redirect.
+        // Follow only same-host HTTPS redirects so POST bodies and the bearer token
+        // remain scoped to api.frame.io. This fixes local_upload failures reported
+        // as HTTP 307 without weakening the gateway's redirect boundary.
+        if (($status === 307 || $status === 308) && preg_match('/^Location:\s*([^\r\n]+)/im', $responseHeaders, $lm) && $redirect < $maxRedirects) {
+            $location = trim($lm[1]);
+            $nextUrl = gbirds_resolve_url($currentUrl, $location);
+            $next = parse_url($nextUrl);
+            $base = parse_url($url);
+            $valid = is_array($next) && is_array($base)
+                && strtolower((string)($next['scheme'] ?? '')) === 'https'
+                && strtolower((string)($base['scheme'] ?? '')) === 'https'
+                && strtolower((string)($next['host'] ?? '')) === strtolower((string)($base['host'] ?? ''))
+                && $nextUrl !== '';
+            if ($valid) {
+                $currentUrl = $nextUrl;
+                continue;
+            }
         }
+
+        $decoded = json_decode($responseBody, true);
+        if (!is_array($decoded)) {
+            $decoded = ['raw' => trim(substr($responseBody, 0, 2000))];
+        } else {
+            $decoded['_http_status'] = $status;
+            if (isset($responseBody[0]) && !isset($decoded['_raw'])) {
+                $decoded['_raw'] = trim(substr($responseBody, 0, 2000));
+            }
+        }
+        if ($status === 307 || $status === 308) {
+            $location = '';
+            if (preg_match('/^Location:\s*([^\r\n]+)/im', $responseHeaders, $lm)) $location = trim($lm[1]);
+            if ($location !== '') $decoded['_redirect_location'] = $location;
+        }
+        return [$status, $decoded];
     }
-    return [$status, $decoded];
+
+    throw new RuntimeException('Frame.io request exceeded the redirect limit.');
 }
 
 /** Raw S3 presigned-URL PUT — no Frame.io auth headers; the URL itself is signed. */
@@ -452,7 +644,9 @@ function gbirds_s3_put_upload(string $url, string $bytes, string $contentType): 
         CURLOPT_HTTPHEADER => [
             'Content-Type: ' . $contentType,
             'x-amz-acl: private',
-            'Content-Length: ' . strlen($bytes)
+            'Content-Length: ' . strlen($bytes),
+            'User-Agent: ' . GBIRDS_REMOTE_USER_AGENT,
+            'X-GetBirds-Client: ' . GBIRDS_REMOTE_CLIENT
         ]
     ]);
     curl_exec($ch);
@@ -481,14 +675,27 @@ function gbirds_frameio_local_upload(string $accessToken, string $accountId, str
         ['data' => ['name' => $filename, 'file_size' => strlen($bytes)]],
         $accessToken
     );
-    if ($status < 200 || $status >= 300 || empty($data['data']['id'])) {
+    $file = is_array($data['data'] ?? null) ? $data['data'] : [];
+    $fileId = trim((string)($file['id'] ?? ''));
+    $uploadUrls = is_array($file['upload_urls'] ?? null) ? $file['upload_urls'] : [];
+
+    // IMPORTANT: Frame.io can return HTTP 307/308 after it has already created
+    // the local-upload placeholder and included the usable file resource plus
+    // upload_urls in that response. In that case the create operation succeeded;
+    // treating 307 as a failure creates orphaned placeholders and prevents the
+    // S3 PUT from ever happening. Accept the response when the required upload
+    // contract is present. Only require 2xx when the resource is not usable.
+    $redirectCreateAccepted = in_array($status, [307, 308], true)
+        && $fileId !== ''
+        && !empty($uploadUrls);
+    if (($status < 200 || $status >= 300) && !$redirectCreateAccepted) {
         $msg = $data['message'] ?? (($data['error']['message'] ?? null) ?: ('Frame.io local_upload failed (' . $status . ').'));
+        if (!empty($data['_redirect_location'])) $msg .= ' Redirect: ' . (string)$data['_redirect_location'];
         throw new RuntimeException($msg);
     }
-    $file = $data['data'];
-    $fileId = (string)$file['id'];
-    $uploadUrls = is_array($file['upload_urls'] ?? null) ? $file['upload_urls'] : [];
-    if (empty($uploadUrls)) throw new RuntimeException('Frame.io did not return an upload URL.');
+    if ($fileId === '' || empty($uploadUrls)) {
+        throw new RuntimeException('Frame.io local_upload returned no file id/upload URL.' . ($status ? ' (HTTP ' . $status . ')' : ''));
+    }
     $contentType = (string)($file['media_type'] ?? $mediaType);
 
     $offset = 0;
@@ -547,27 +754,38 @@ function gbirds_frameio_begin_auth(): void {
     $postcardId = trim((string)($input['postcardId'] ?? ''));
     $description = gbirds_frameio_clean_description($input['description'] ?? '');
     $metadata = gbirds_frameio_sanitize_metadata_map($input['metadata'] ?? []);
-    if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
-        gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
-    }
-    if ($filename === '') {
-        $filename = 'file_' . md5($mediaUrl) . (preg_match('/\.mp4(?:$|[?#])/i',$mediaUrl) ? '.mp4' : '.jpg');
+    $authOnly = !empty($input['auth_only']);
+
+    // The Adobe gate is reusable for every Frame.io producer, including local GO LIVE
+    // captures that do not have a remote media URL. An auth-only request starts the
+    // exact same Adobe IMS login without pretending there is an upload payload.
+    if (!$authOnly) {
+        if ($mediaUrl === '' || !gbirds_allowed_media_url($mediaUrl)) {
+            gbirds_json_response(['ok'=>false,'error'=>'Invalid BirdBuddy media URL.'],400);
+        }
+        if ($filename === '') {
+            $filename = 'file_' . md5($mediaUrl) . (preg_match('/\.mp4(?:$|[?#])/i',$mediaUrl) ? '.mp4' : '.jpg');
+        }
     }
 
     // Explicit first-click gate: discard any previously cached Frame.io/IMS token
-    // so Send to Adobe can never silently reuse an old account/profile.
+    // so every producer uses the same Adobe IMS login/profile gate.
     unset($_SESSION['frameio_access_token'], $_SESSION['frameio_refresh_token'], $_SESSION['frameio_expires_at'], $_SESSION['frameio_account_id'], $_SESSION['frameio_ims_org_id'], $_SESSION['frameio_ims_user_id'], $_SESSION['frameio_date_folders'], $_SESSION['frameio_auth_error']);
     $_SESSION['frameio_usage_id'] = $usageId;
     $_SESSION['frameio_usage_authenticated'] = false;
-    $_SESSION['frameio_pending_upload'] = [
-        'mediaUrl'=>$mediaUrl,
-        'filename'=>$filename,
-        'createdAt'=>$createdAt,
-        'species'=>$species,
-        'postcardId'=>$postcardId,
-        'description'=>$description,
-        'metadata'=>$metadata
-    ];
+    if (!$authOnly) {
+        $_SESSION['frameio_pending_upload'] = [
+            'mediaUrl'=>$mediaUrl,
+            'filename'=>$filename,
+            'createdAt'=>$createdAt,
+            'species'=>$species,
+            'postcardId'=>$postcardId,
+            'description'=>$description,
+            'metadata'=>$metadata
+        ];
+    } else {
+        unset($_SESSION['frameio_pending_upload']);
+    }
 
     try {
         $authorizeUrl = gbirds_frameio_authorize_url();
@@ -600,7 +818,10 @@ function gbirds_frameio_authorize_url(): string {
         'response_mode' => 'query',
         'state' => $state,
         'nonce' => $nonce,
-        'prompt' => 'login select_account',
+        // Adobe IMS documents only "none" and "login" for prompt.
+        // login forces a fresh Adobe authentication screen; profile/org selection
+        // itself remains an Adobe-controlled part of that login flow.
+        'prompt' => 'login',
     ], '', '&', PHP_QUERY_RFC3986);
     return $cfg['ims_base'] . '/ims/authorize/v2?' . $query;
 }
@@ -618,6 +839,8 @@ function gbirds_frameio_exchange_code(string $code): array {
         CURLOPT_HTTPHEADER => [
             'Content-Type: application/x-www-form-urlencoded',
             'Accept: application/json',
+            'User-Agent: ' . GBIRDS_REMOTE_USER_AGENT,
+            'X-GetBirds-Client: ' . GBIRDS_REMOTE_CLIENT,
             'Authorization: Basic ' . base64_encode($cfg['client_id'] . ':' . $cfg['client_secret']),
         ],
         CURLOPT_POSTFIELDS => http_build_query([
@@ -678,6 +901,8 @@ function gbirds_frameio_refresh(): bool {
         CURLOPT_HTTPHEADER => [
             'Content-Type: application/x-www-form-urlencoded',
             'Accept: application/json',
+            'User-Agent: ' . GBIRDS_REMOTE_USER_AGENT,
+            'X-GetBirds-Client: ' . GBIRDS_REMOTE_CLIENT,
             'Authorization: Basic ' . base64_encode($cfg['client_id'] . ':' . $cfg['client_secret']),
         ],
         CURLOPT_POSTFIELDS => http_build_query([
@@ -1504,6 +1729,8 @@ function gbirds_frameio_send(): void {
                 'projectName'=>$project['name'] ?? 'Project_FIREBIRD',
                 'destination'=>$destination,
                 'folderId'=>$folderId,
+                'folderName'=>$dateName,
+                'folderViewUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id']) . '/' . rawurlencode($folderId),
                 'dateName'=>$dateName,
                 'file'=>['id'=>$existingFileId,'name'=>$remoteName],
                 'viewUrl'=>$dupViewUrl,
@@ -1601,6 +1828,7 @@ function gbirds_frameio_send(): void {
             'projectName'=>$project['name'] ?? 'Project_FIREBIRD',
             'destination'=>$destination,
             'folderId'=>$folderId,
+            'folderViewUrl'=>'https://next.frame.io/project/' . rawurlencode($cfg['project_id']) . '/' . rawurlencode($folderId),
             'collectionId'=>$destination === 'collection' ? $collectionId : '',
             'dateName'=>$dateName,
             'folderName'=>$dateName,
@@ -1638,7 +1866,7 @@ function gbirds_frameio_send_local(): void {
     $cfg = gbirds_frameio_config();
 
     if (empty($_SESSION['frameio_usage_authenticated'])) {
-        gbirds_json_response(['ok'=>false,'needsAuth'=>true,'error'=>'Sign in to Adobe first.'],401);
+        gbirds_json_response(['ok'=>false,'needsAuth'=>true,'forceLogin'=>true,'error'=>'Adobe sign-in required before sending to Frame.io.'],401);
     }
     try {
         $token = gbirds_frameio_access_token();
@@ -1979,6 +2207,35 @@ function gbirds_firebird_placeholder(): void {
 }
 
 
+
+/** Guard the full client application behind a verified BirdBuddy camera. */
+function gbirds_app_shell_authorize(): void {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') gbirds_json_response(['ok'=>false],405);
+    $body = json_encode([
+        'operationName' => 'me',
+        'variables' => new stdClass(),
+        'query' => 'query me { me { feeders { __typename ... on FeederForMember { id } ... on FeederForOwner { id } ... on FeederForMemberPending { id } } } }'
+    ], JSON_UNESCAPED_SLASHES);
+    gbirds_require_curl();
+    $ch = curl_init('https://graphql.app-api.prod.aws.mybirdbuddy.com/graphql');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body,
+        CURLOPT_HTTPHEADER => gbirds_forward_headers(['Content-Type: application/json']),
+        CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 10, CURLOPT_TIMEOUT => 25,
+        CURLOPT_FOLLOWLOCATION => false,
+    ]);
+    $raw = curl_exec($ch);
+    if ($raw === false) { curl_close($ch); gbirds_json_response(['ok'=>false],401); }
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+    if ($status < 200 || $status >= 300) gbirds_json_response(['ok'=>false],401);
+    $data = json_decode($raw, true);
+    if (!is_array($data)) gbirds_json_response(['ok'=>false,'error'=>'BirdBuddy returned invalid JSON.'],502);
+    if (!empty($data['errors'])) gbirds_json_response(['ok'=>false,'error'=>$data['errors'][0]['message'] ?? 'BirdBuddy verification failed.'],401);
+    $feeders = $data['data']['me']['feeders'] ?? null;
+    if (!is_array($feeders) || count($feeders) < 1) gbirds_json_response(['ok'=>false,'error'=>'No BirdBuddy camera is associated with this Google account.'],403);
+    $GLOBALS['gbirds_render_full_app'] = true;
+}
+
 if (!empty($_GET['frameio_resume'])) {
     gbirds_session_start();
     // Keep the pending payload in session until the resume request succeeds.
@@ -1989,8 +2246,12 @@ if (!empty($_GET['frameio_resume'])) {
 }
 
 $api = strtolower(trim((string)($_GET['api'] ?? '')));
+if ($api === 'app-shell') gbirds_app_shell_authorize();
 if ($api === 'birdbuddy') gbirds_proxy_graphql();
 if ($api === 'birdbuddy-media') gbirds_proxy_media();
+if ($api === 'birdbuddy-assets-xml') gbirds_proxy_birdbuddy_assets_xml();
+if ($api === 'birdbuddy-asset-download') gbirds_proxy_birdbuddy_asset_download();
+if ($api === 'birdbuddy-assets') gbirds_proxy_birdbuddy_assets();
 if ($api === 'hls-proxy') gbirds_hls_proxy();
 if ($api === 'frameio-auth-begin') gbirds_frameio_begin_auth();
 if ($api === 'frameio-auth-reset') {
@@ -2011,7 +2272,16 @@ if ($api === 'frameio-collections-debug') gbirds_frameio_collections_debug();
 if ($api === 'frameio-status-fields-debug') gbirds_frameio_status_fields_debug();
 if ($api === 'frameio-logout') { gbirds_frameio_clear_session(); gbirds_json_response(['ok'=>true]); }
 if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
+
+// The browser-side BirdBuddy auth flow is the authoritative gate. Rendering the
+// application shell here is intentional: unauthenticated users still see only
+// the login surface, while authenticated users are admitted/denied by the same
+// authSocialSignIn -> me -> feed path that powers the app itself. A server-side
+// preflight cannot safely classify BirdBuddy feeder unions and previously turned
+// valid camera users into the login/no-camera state.
+$GLOBALS['gbirds_render_full_app'] = true;
 ?>
+<?php if (!empty($GLOBALS['gbirds_render_full_app'])) { ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2020,6 +2290,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   <title>GetBirds — Your postcards</title>
   <link rel="preconnect" href="https://accounts.google.com" />
   <link rel="preconnect" href="https://graphql.app-api.prod.aws.mybirdbuddy.com" />
+  <link rel="preconnect" href="https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -2039,9 +2310,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       --accent-hover: #572d73;
       --accent-light: #eadff0;
       --error: #c23d3d;
-      --radius: 12px;
-      --radius-sm: 8px;
-      --media-radius: 22px;
+      --radius: 18px;
+      --radius-sm: 12px;
+      --media-radius: 26px;
       --shadow: 0 2px 8px rgba(0,0,0,0.06);
       --shadow-hover: 0 4px 16px rgba(0,0,0,0.08);
     }
@@ -2066,14 +2337,103 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
     .screen.hidden { display: none !important; }
 
-    /* When login screen is visible it fully covers the viewport; no app UI shows through. */
+    /* Logged-out landing page: randomly sampled BirdBuddy assets in a fully responsive, geometry-driven mural. */
     #loginScreen:not(.hidden) {
       position: fixed;
       inset: 0;
       width: 100%;
       height: 100%;
-      background: var(--bg);
+      min-height: 100vh;
+      padding: 0;
+      overflow: hidden;
+      background: #17131a;
       z-index: 10;
+      isolation: isolate;
+    }
+
+    .login-asset-wall {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      width: 100%;
+      height: 100%;
+      padding: 0;
+      margin: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: repeat(var(--login-grid-cols, 8), minmax(0, 1fr));
+      grid-template-rows: repeat(var(--login-grid-rows, 5), minmax(0, 1fr));
+      gap: 0;
+      background: #17131a;
+    }
+
+    .login-asset-tile {
+      position: relative;
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+      margin: 0;
+      overflow: hidden;
+      border: 0;
+      border-radius: 0;
+      background: #241d28;
+    }
+
+    .login-asset-tile img {
+      display: block !important;
+      width: 100% !important;
+      height: 100% !important;
+      max-width: none !important;
+      max-height: none !important;
+      min-width: 0 !important;
+      min-height: 0 !important;
+      object-fit: cover !important;
+      object-position: center !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+      background: #241d28;
+    }
+
+    .login-asset-shade {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      background: radial-gradient(circle at center, rgba(0,0,0,0.06), rgba(0,0,0,0.18));
+    }
+
+    .login-asset-wall::-webkit-scrollbar { width: 0; height: 0; }
+    .login-asset-wall::-webkit-scrollbar-thumb { background: transparent; }
+    .login-asset-wall::-webkit-scrollbar-track { background: transparent; }
+
+    /* Keep the login control centered and above both mural layers on every client. */
+    #loginBtn {
+      position: absolute !important;
+      z-index: 3 !important;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      margin: 0;
+      white-space: nowrap;
+      box-shadow: 0 12px 36px rgba(0,0,0,0.35), 0 0 0 4px rgba(255,255,255,0.16);
+    }
+
+    #loginBtn:hover:not(:disabled) {
+      transform: translate(-50%, -51%) scale(1.02);
+    }
+
+    #loginBtn:active:not(:disabled) {
+      transform: translate(-50%, -49%) scale(0.99);
+    }
+
+    @media (max-width: 640px) {
+      #loginBtn {
+        max-width: calc(100vw - 2rem);
+        padding: 0.8rem 1.1rem;
+        font-size: 0.95rem;
+      }
     }
 
     .brand {
@@ -2091,6 +2451,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
 
     .login-btn {
+      position: relative;
+      z-index: 3;
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -2119,6 +2481,110 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       cursor: not-allowed;
     }
 
+    /* Hard visual bootstrap gate: the app shell is never visible until BirdBuddy
+       authorization has positively established at least one camera. */
+    #loggedInScreen { display: none; }
+    #loggedInScreen.app-authorized { display: grid; }
+
+    /* No-camera state is deliberately contentless: the mascot sits directly on
+       the user's Google avatar, which is the only interactive control. */
+    #noCameraGate {
+      position: fixed;
+      inset: 0;
+      z-index: 100000;
+      display: grid;
+      place-items: center;
+      width: 100vw;
+      height: 100vh;
+      min-height: 100vh;
+      overflow: hidden;
+      background: radial-gradient(circle at 50% 35%, rgba(111,60,143,0.16), transparent 42%), linear-gradient(145deg, #f8f4fa 0%, #ece5f1 52%, #dfd3e7 100%);
+      isolation: isolate;
+    }
+    #noCameraGate.hidden { display: none !important; }
+    .no-camera-gate-inner {
+      width: 100vw;
+      height: 100dvh;
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      align-items: center;
+      justify-items: center;
+      gap: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+    .no-camera-gate-avatar-wrap {
+      grid-column: 2;
+      grid-row: 1;
+      position: relative;
+      z-index: 3;
+      width: min(40vw, 80vh);
+      height: min(40vw, 80vh);
+      max-width: 80vh;
+      max-height: 80vh;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      cursor: pointer;
+      background: #fff;
+      box-shadow: 0 28px 80px rgba(33,27,38,0.24), 0 0 0 1px rgba(255,255,255,0.75);
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
+    }
+    .no-camera-gate-avatar-wrap .avatar {
+      width: 100%;
+      height: 100%;
+      display: block;
+      object-fit: cover;
+      border-radius: 50%;
+      border-width: clamp(4px, 0.45vw, 8px);
+      background: var(--surface-alt, #ece5f1);
+    }
+    .no-camera-gate-avatar-wrap:hover {
+      transform: scale(1.025);
+      box-shadow: 0 34px 92px rgba(33,27,38,0.30), 0 0 0 1px rgba(255,255,255,0.82);
+    }
+    .no-camera-gate-avatar-wrap:hover .avatar-logout-overlay,
+    .no-camera-gate-avatar-wrap:focus-visible .avatar-logout-overlay { opacity: 1; }
+    .no-camera-gate-avatar-wrap .avatar-logout-overlay {
+      font-size: clamp(3rem, 6vw, 6rem);
+    }
+    .no-camera-gate-mascot {
+      grid-column: 1;
+      grid-row: 1;
+      width: 100%;
+      height: 100%;
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      object-position: center center;
+      display: block;
+      margin: 0;
+      filter: drop-shadow(0 32px 60px rgba(33,27,38,0.22));
+      transform-origin: center center;
+      animation: noCameraVisitorFloat 4.8s ease-in-out infinite;
+    }
+    @keyframes noCameraVisitorFloat {
+      0%, 100% { transform: translateY(0) rotate(-0.35deg); }
+      50% { transform: translateY(-10px) rotate(0.35deg); }
+    }
+    @media (max-width: 640px) {
+      .no-camera-gate-inner {
+        width: 100vw;
+        height: 100dvh;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      }
+      .no-camera-gate-avatar-wrap {
+        width: min(42vw, 80vh);
+        height: min(42vw, 80vh);
+      }
+      .no-camera-gate-mascot {
+        width: 100%;
+        height: 100%;
+      }
+    }
+
     .login-btn svg {
       width: 20px;
       height: 20px;
@@ -2135,32 +2601,37 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       isolation: isolate;
     }
 
+    /* App shell header: one compact master row. The former two rows are still
+       semantic wrappers in the markup, but participate as a single flex line so
+       the status message can sit between the filter rail and the hard-right view controls. */
     .header {
       position: sticky;
       top: 0;
       z-index: 40;
       display: flex;
-      flex-direction: column;
-      align-items: stretch;
-      padding: 0.875rem 1.25rem 0.75rem;
+      flex-direction: row;
+      align-items: center;
+      min-width: 0;
+      padding: 0.55rem 1.25rem;
       background: var(--surface);
       border-bottom: 1px solid var(--border);
-      gap: 0.7rem;
+      gap: 0.65rem;
       box-shadow: var(--shadow);
+      white-space: nowrap;
     }
 
-    .header-main {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 1rem;
-      min-width: 0;
+    .header-main,
+    .sub-header-row {
+      display: contents;
     }
 
     .header-profile {
+      order: 1;
       display: flex;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.55rem;
+      flex: 0 0 auto;
+      min-width: 0;
     }
 
     .avatar {
@@ -2213,13 +2684,14 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
 
     .header-status {
-      flex: 1;
-      min-width: 0;
+      order: 3;
+      flex: 1 1 18rem;
+      min-width: 6rem;
       text-align: center;
-      font-size: 0.875rem;
+      font-size: 0.78rem;
       font-weight: 500;
       color: var(--text-soft);
-      padding: 0 1rem;
+      padding: 0 0.45rem;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -2242,10 +2714,11 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
 
     .header-actions {
+      order: 4;
       display: flex;
       align-items: center;
-      gap: 0.5rem;
-      flex-wrap: wrap;
+      gap: 0.4rem;
+      flex: 0 0 auto;
     }
 
     .btn {
@@ -2476,26 +2949,6 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       box-shadow: var(--shadow);
     }
 
-    .postcard-group-label {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.8125rem;
-      font-weight: 600;
-      color: var(--accent);
-      margin-bottom: 0.75rem;
-      padding-bottom: 0.5rem;
-      border-bottom: 1px solid var(--accent-light);
-    }
-
-    .postcard-group-label .badge {
-      font-weight: 500;
-      color: var(--text-soft);
-      background: var(--surface-alt);
-      padding: 0.2rem 0.5rem;
-      border-radius: 4px;
-    }
-
     .postcard-group-media {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -2510,8 +2963,6 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     /* GO LIVE capture — the resulting feed card holds ONLY saved still frames
        (normal media-cards with Download/Send to Adobe); its label is tinted
        to flag it as live-sourced. */
-    .live-capture-group .postcard-group-label { color: #ff453a; }
-
     @media (max-width: 980px) {
       .postcard-group-media {
         grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
@@ -2584,6 +3035,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       flex-wrap: wrap;
       gap: 0.5rem;
     }
+    .postcard-group-footer > .postcard-group-actions { margin-left: auto; }
 
     .postcard-group-actions .btn {
       padding: 0.4rem 0.75rem;
@@ -2728,15 +3180,34 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
        apply to whichever feed is loaded, not a feed-source switcher, so it
        lives here rather than among the header's top source buttons. */
     .sub-header-row {
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
+      order: 2;
     }
-    .sub-header-row .carousel-view-btn {
+    .sub-header-view-actions {
+      order: 5;
       margin-left: auto;
-      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      flex: 0 0 auto;
     }
-
+    .sub-header-view-actions .carousel-view-btn,
+    .sub-header-view-actions .postcard-sort-select-wrap { flex-shrink: 0; }
+    .postcard-sort-select-wrap { display: inline-flex; align-items: center; }
+    .postcard-sort-select-wrap[hidden] { display: none !important; }
+    .postcard-sort-select {
+      appearance: none; -webkit-appearance: none; min-width: 5.8rem; height: 2.35rem;
+      padding: 0 2rem 0 0.82rem; border: 1px solid var(--border); border-radius: 999px;
+      color: var(--text); background: var(--surface); font: 700 0.72rem/1 inherit;
+      letter-spacing: 0.045em; cursor: pointer;
+      background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+      background-position: calc(100% - 13px) 10px, calc(100% - 9px) 10px;
+      background-size: 4px 4px, 4px 4px; background-repeat: no-repeat;
+    }
+    .postcard-sort-select:hover, .postcard-sort-select:focus-visible {
+      border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgba(111,60,143,0.12); color: var(--accent);
+    }
+    .postcard-sort-select[data-active="true"] { background-color: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+    .sr-only { position:absolute !important; width:1px !important; height:1px !important; padding:0 !important; margin:-1px !important; overflow:hidden !important; clip:rect(0,0,0,0) !important; white-space:nowrap !important; border:0 !important; }
     .species-filter-bar {
       flex: 1;
       min-width: 0;
@@ -2787,16 +3258,29 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
 
     @media (max-width: 980px) {
-      .header-main {
-        grid-template-columns: 1fr;
-        gap: 0.55rem;
+      .header {
+        flex-wrap: wrap;
+        white-space: normal;
+      }
+      .header-profile {
+        flex: 0 0 auto;
+      }
+      .species-filter-bar {
+        flex: 1 1 18rem;
+        min-width: 12rem;
       }
       .header-status {
+        order: 4;
+        flex: 1 1 100%;
         text-align: left;
-        padding: 0;
+        padding: 0.05rem 0.1rem 0;
       }
       .header-actions {
-        justify-content: flex-start;
+        order: 3;
+      }
+      .sub-header-view-actions {
+        order: 3;
+        margin-left: auto;
       }
     }
 
@@ -2871,6 +3355,99 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
     .modal-body .modal-actions .btn:hover { background: var(--accent-hover); }
 
+    /* First-login UFO prompt: one simple choice before the feed continues. */
+    .ufo-detect-modal { width: min(420px, 92vw); }
+    .ufo-detect-modal .modal-body { padding: 1.35rem 1.4rem 1.25rem; }
+    .ufo-detect-modal .ufo-detect-message {
+      margin: 0 0 1rem;
+      font-size: 1.05rem;
+      font-weight: 700;
+      line-height: 1.35;
+      color: var(--text);
+    }
+    .ufo-detect-modal .modal-actions { justify-content: flex-end; }
+    .ufo-detect-modal .ufo-no { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+    .ufo-detect-modal .ufo-no:hover { background: var(--surface-alt); color: var(--text); }
+
+    /* UFO prompt — Mystery Visitor mascot is the visual anchor; message sits to its right. */
+    .ufo-detect-modal {
+      width: min(560px, calc(100vw - 2rem));
+      border: 1px solid rgba(111,60,143,0.18);
+      box-shadow: 0 18px 60px rgba(33,27,38,0.28);
+      position: relative;
+    }
+    .ufo-detect-modal .ufo-detect-body { padding: 1.1rem 1.15rem 1.15rem; }
+    .ufo-detect-hero {
+      display: grid;
+      grid-template-columns: minmax(120px, 150px) minmax(0, 1fr);
+      align-items: center;
+      gap: 1rem;
+      min-height: 150px;
+    }
+    .ufo-detect-mascot-wrap {
+      width: 150px;
+      height: 150px;
+      display: grid;
+      place-items: center;
+      border-radius: 28px;
+      background: linear-gradient(145deg, #f0e8f4, #fff);
+      border: 1px solid rgba(111,60,143,0.14);
+      overflow: hidden;
+    }
+    .ufo-detect-mascot { width: 132px; height: 132px; object-fit: contain; display: block; }
+    .ufo-detect-copy { min-width: 0; padding-right: 2.25rem; }
+    .ufo-detect-kicker {
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 0.25rem;
+    }
+    .ufo-detect-modal .ufo-detect-message {
+      margin: 0;
+      font-size: clamp(1.1rem, 3vw, 1.45rem);
+      font-weight: 800;
+      line-height: 1.2;
+      color: var(--text);
+    }
+    .ufo-detect-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.65rem;
+      margin-top: 1rem;
+    }
+    .ufo-detect-actions .btn { min-height: 2.75rem; }
+    .ufo-detect-modal > .modal-close {
+      position: absolute;
+      top: 0.65rem;
+      right: 0.7rem;
+      z-index: 4;
+    }
+    @media (max-width: 520px) {
+      .ufo-detect-modal { width: min(96vw, 430px); }
+      .ufo-detect-modal .ufo-detect-body { padding: 0.85rem 0.9rem 0.9rem; }
+      .ufo-detect-hero { grid-template-columns: 96px minmax(0,1fr); gap: 0.8rem; min-height: 96px; }
+      .ufo-detect-mascot-wrap { width: 96px; height: 96px; border-radius: 22px; }
+      .ufo-detect-mascot { width: 86px; height: 86px; }
+      .ufo-detect-copy { padding-right: 1.9rem; }
+      .ufo-detect-actions { grid-template-columns: 1fr 1fr; margin-top: 0.85rem; }
+    }
+
+    /* BirdBuddy ASSETS — continuous mural. */
+    .asset-bucket-modal { width:min(1440px,98vw); height:min(96vh,1200px); max-height:96vh; position:relative; background:#f5f1f8; display:flex; flex-direction:column; min-height:0; }
+    .asset-bucket-modal > .modal-close { position:absolute; top:.55rem; right:.7rem; z-index:20; width:2.1rem; height:2.1rem; display:grid; place-items:center; background:rgba(255,255,255,.96); border:1px solid #d3c7da; border-radius:999px; box-shadow:0 5px 18px rgba(33,27,38,.18); }
+    .asset-bucket-body { padding:0; min-height:0; min-width:0; display:block; flex:1 1 auto; overflow:auto; background:#f5f1f8; }
+    .asset-bucket-grid { width:100%; min-height:100%; overflow:visible; padding:14px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; align-content:start; align-items:start; }
+    .asset-bucket-card { position:relative; display:block; width:100%; height:auto; min-width:0; margin:0; padding:0; border:1px solid #d3c7da; border-radius:12px; overflow:hidden; background:#fff; box-shadow:0 3px 10px rgba(33,27,38,.10); cursor:pointer; text-decoration:none; line-height:0; }
+    .asset-bucket-card img { display:block !important; width:100% !important; height:auto !important; max-width:100% !important; max-height:none !important; min-width:0 !important; min-height:0 !important; object-fit:initial !important; background:#eee6f1 !important; visibility:visible !important; opacity:1 !important; }
+    .asset-bucket-card .asset-bucket-filemark { min-height:180px; display:grid; place-items:center; padding:12px; text-align:center; color:#76697c; background:#eee6f1; font-size:11px; line-height:1.3; }
+    .asset-bucket-hover { position:absolute; inset:auto 0 0 0; display:flex; flex-direction:column; justify-content:flex-end; padding:10px; background:linear-gradient(180deg,transparent 0%,rgba(20,14,24,.92) 100%); color:#fff; opacity:0; transition:opacity .14s ease; pointer-events:none; line-height:1.2; }
+    .asset-bucket-card:hover .asset-bucket-hover,.asset-bucket-card:focus-visible .asset-bucket-hover { opacity:1; }
+    .asset-bucket-name { font-size:12px; font-weight:800; line-height:1.2; word-break:break-word; text-shadow:0 1px 2px rgba(0,0,0,.55); }
+    .asset-bucket-meta { margin-top:4px; font-size:9px; line-height:1.3; opacity:.92; word-break:break-word; }
+    .asset-bucket-empty { grid-column:1/-1; padding:3rem 1rem; text-align:center; color:#76697c; }
+    @media(max-width:640px){.asset-bucket-modal{width:96vw;height:94vh}.asset-bucket-grid{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px;padding:8px}.asset-bucket-name{font-size:10px}.asset-bucket-meta{font-size:8px}}
     .btn-tv {
       position: relative;
       padding: 0.4rem 0.5rem;
@@ -2914,6 +3491,168 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     .btn-whodat:hover { background: #e7d3a1; color: #101820; }
     .btn-whodat.uploading { opacity: 0.7; pointer-events: none; }
 
+
+    /* —— Shared species identity visual system —— */
+    .species-identity {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      min-width: 0;
+    }
+    .species-icon {
+      width: 2.35rem;
+      height: 2.35rem;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      object-fit: contain;
+      object-position: center;
+      padding: 0.14rem;
+      background: #fff;
+      border: 1px solid rgba(111,60,143,0.18);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+    .species-icon.species-icon-large { width: 3.6rem; height: 3.6rem; padding: 0.2rem; }
+    .species-icon-fallback {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2.35rem;
+      height: 2.35rem;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--accent-light);
+      border: 1px solid rgba(111,60,143,0.18);
+      font-size: 1.15rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+    .species-identity-copy { min-width: 0; display: flex; flex-direction: column; gap: 0.08rem; }
+    .species-identity-name { font-size: 0.94rem; font-weight: 700; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .species-identity-sci { font-size: 0.72rem; font-style: italic; color: var(--muted); line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .species-chip {
+      display: inline-flex; align-items: center; gap: 0.42rem;
+      padding: 0.28rem 0.62rem 0.28rem 0.34rem;
+      font-size: 0.78rem; font-weight: 600; font-family: inherit;
+      color: var(--text); background: var(--surface);
+      border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+      transition: background 0.2s, border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+    }
+    .species-chip .species-icon, .species-chip .species-icon-fallback { width: 1.7rem; height: 1.7rem; font-size: 0.82rem; box-shadow: none; border-color: transparent; background: var(--surface-alt); }
+    .species-chip:hover { background: var(--accent-light); border-color: var(--accent); color: var(--accent); transform: translateY(-1px); box-shadow: 0 3px 10px rgba(111,60,143,0.12); }
+    .species-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 4px 12px rgba(111,60,143,0.2); }
+    .species-chip.active .species-icon, .species-chip.active .species-icon-fallback { background: rgba(255,255,255,0.92); }
+    /* Postcard top rail: one purple metadata band containing species + all postcard metadata. */
+    .postcard-species-strip {
+      display: flex;
+      align-items: center;
+      gap: 0.8rem 1rem;
+      margin-bottom: 0.8rem;
+      padding: 0.48rem 0.7rem;
+      border: 1px solid rgba(111,60,143,0.14);
+      border-radius: 16px;
+      background: linear-gradient(90deg, rgba(234,223,240,0.78), rgba(255,255,255,0.96));
+      min-width: 0;
+      overflow: hidden;
+    }
+    .postcard-species-list {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      min-width: 0;
+      flex: 0 0 auto;
+    }
+    .postcard-species-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.38rem;
+      min-width: 0;
+      padding: 0.2rem 0.46rem 0.2rem 0.26rem;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(111,60,143,0.12);
+      border-radius: 999px;
+      box-shadow: 0 1px 4px rgba(33,27,38,0.05);
+    }
+    .postcard-species-pill .species-icon, .postcard-species-pill .species-icon-fallback {
+      width: 2.45rem;
+      height: 2.45rem;
+      font-size: 1rem;
+      box-shadow: none;
+      padding: 0.16rem;
+    }
+    .postcard-species-pill .species-identity-copy { gap: 0; }
+    .postcard-species-pill .species-identity-name { font-size: 0.82rem; }
+    .postcard-species-pill .species-identity-sci { display: none; }
+    .postcard-meta-rail {
+      display: flex;
+      align-items: center;
+      flex: 1 1 auto;
+      min-width: 0;
+      gap: 0.35rem 0.85rem;
+      flex-wrap: wrap;
+    }
+    .postcard-meta-rail .meta-row {
+      display: inline-flex;
+      align-items: baseline;
+      min-width: 0;
+      max-width: 100%;
+      gap: 0.2rem;
+      font-size: 0.72rem;
+      line-height: 1.2;
+    }
+    .postcard-meta-rail .meta-label {
+      flex: 0 0 auto;
+      font-weight: 700;
+      color: var(--text-soft);
+    }
+    .postcard-meta-rail .meta-value {
+      min-width: 0;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .postcard-meta-rail .meta-row-id {
+      flex: 1 1 18rem;
+      min-width: 12rem;
+    }
+    .postcard-meta-rail .meta-row-checkbox { align-items: center; }
+    .postcard-meta-rail .meta-row-checkbox input[type="checkbox"] {
+      margin: 0;
+      width: 0.85rem;
+      height: 0.85rem;
+      accent-color: var(--accent);
+    }
+    .postcard-meta-rail .meta-count {
+      font-weight: 700;
+      color: var(--text-soft);
+    }
+    .postcard-species-empty { color: var(--muted); font-size: 0.82rem; }
+    @media (max-width: 760px) {
+      .postcard-species-strip { align-items: flex-start; flex-wrap: wrap; }
+      .postcard-species-list { flex: 1 1 100%; }
+      .postcard-meta-rail { flex: 1 1 100%; }
+      .postcard-meta-rail .meta-row-id { flex-basis: 100%; min-width: 0; }
+      .postcard-meta-rail .meta-value { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+    }
+    .who-dat-result {
+      margin-top: 0.6rem; padding: 0.8rem; border-radius: 18px;
+      background: linear-gradient(135deg, rgba(211,188,141,0.24), rgba(255,255,255,0.96));
+      border: 1px solid rgba(16,24,32,0.14);
+      display: flex; align-items: center; gap: 0.75rem;
+    }
+    .who-dat-result .species-icon, .who-dat-result .species-icon-fallback { width: 3.25rem; height: 3.25rem; }
+    .who-dat-result .who-dat-copy { min-width: 0; }
+    .who-dat-kicker { font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .species-collection-card {
+      padding: 0.75rem; border: 1px solid var(--border); background: var(--surface);
+      border-radius: 22px; box-shadow: var(--shadow); text-align: left;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+    .species-collection-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-hover); border-color: rgba(111,60,143,0.35); }
+    .species-collection-img { border-radius: 18px; }
+    .species-collection-head { display: flex; align-items: center; gap: 0.65rem; margin: 0.7rem 0 0.55rem; }
+    .species-collection-head .species-icon, .species-collection-head .species-icon-fallback { width: 3.1rem; height: 3.1rem; }
+    .species-collection-card .species-collection-name { margin: 0; }
 
     /* Community level 1 — species collection cards */
     .species-collection-grid {
@@ -3021,6 +3760,19 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       height: 64px;
       margin: 0 auto 0.5rem;
     }
+    .firebird-feed-status {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.25rem;
+      min-height: 190px;
+      padding: 1.5rem;
+      color: var(--text-soft);
+      text-align: center;
+    }
+    .firebird-feed-status .firebird-feed-spinner { width: 260px; }
+    .firebird-feed-sub { font-size: 0.82rem; color: var(--muted); }
     .firebird-trail {
       position: absolute;
       top: 50%;
@@ -3320,12 +4072,109 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       line-height: 1.15rem;
       text-align: center;
     }
+    /* Filter rail v2 — compact by default; only the selected filter expands to a labeled pill. */
+    .species-filter-bar {
+      order: 2;
+      flex: 1 1 24rem;
+      min-width: 10rem;
+      margin: 0;
+      padding: 0.25rem 0.3rem;
+      background: rgba(234,223,240,0.56);
+      border: 1px solid rgba(111,60,143,0.15);
+      border-radius: 999px;
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: 0.4rem;
+      overflow-x: auto;
+      overflow-y: hidden;
+      scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+      min-height: 3.05rem;
+    }
+    .species-filter-bar::-webkit-scrollbar { width: 0; height: 0; }
+    .species-filter-bar .filter-label { display: none !important; }
+    .species-chip {
+      flex: 0 0 auto;
+      width: 2.55rem;
+      height: 2.55rem;
+      min-width: 2.55rem;
+      padding: 0.2rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.42rem;
+      font-family: inherit;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      overflow: hidden;
+      white-space: nowrap;
+      transition: width 0.18s ease, min-width 0.18s ease, background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+    }
+    .species-chip:hover {
+      background: var(--accent-light);
+      border-color: rgba(111,60,143,0.48);
+      color: var(--accent);
+      transform: translateY(-1px);
+      box-shadow: 0 3px 10px rgba(111,60,143,0.12);
+    }
+    .species-chip .filter-chip-icon {
+      width: 2.05rem;
+      height: 2.05rem;
+      min-width: 2.05rem;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      background: var(--surface-alt);
+      border: 1px solid rgba(111,60,143,0.08);
+      font-size: 0.98rem;
+      line-height: 1;
+    }
+    .species-chip .filter-chip-icon img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .species-chip .filter-chip-text {
+      display: none;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .species-chip.active {
+      width: auto;
+      min-width: 0;
+      max-width: min(280px, 72vw);
+      padding-right: 0.8rem;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 4px 12px rgba(111,60,143,0.2);
+    }
+    .species-chip.active .filter-chip-icon {
+      background: rgba(255,255,255,0.92);
+      border-color: transparent;
+    }
+    .species-chip.active .filter-chip-text { display: block; }
+    @media (max-width: 640px) {
+      .species-filter-bar {
+        min-height: 2.8rem;
+        padding: 0.2rem 0.25rem;
+        gap: 0.32rem;
+      }
+      .species-chip { width: 2.35rem; min-width: 2.35rem; height: 2.35rem; padding: 0.15rem; }
+      .species-chip .filter-chip-icon { width: 1.95rem; height: 1.95rem; min-width: 1.95rem; font-size: 0.9rem; }
+      .species-chip.active { max-width: 68vw; padding-right: 0.68rem; }
+    }
+
   </style>
 </head>
 <body>
   <main id="loginScreen" class="screen">
-    <h1 class="brand">GetBirds</h1>
-    <p class="tagline">chirp chirp</p>
+    <div id="loginAssetWall" class="login-asset-wall" aria-hidden="true"></div>
+    <div class="login-asset-shade" aria-hidden="true"></div>
     <button type="button" id="loginBtn" class="login-btn">
       <svg viewBox="0 0 24 24">
         <path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
@@ -3335,6 +4184,16 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       </svg>
       Sign in with Google
     </button>
+  </main>
+
+  <main id="noCameraGate" class="hidden" aria-label="">
+    <div class="no-camera-gate-inner">
+      <img id="noCameraGateMascot" class="no-camera-gate-mascot" alt="" />
+      <div id="noCameraGateAvatarWrap" class="no-camera-gate-avatar-wrap avatar-wrap" role="button" tabindex="0" title="Sign out" aria-label="Sign out">
+        <img id="noCameraGateAvatar" class="avatar" src="" alt="" />
+        <span class="avatar-logout-overlay" aria-hidden="true">&times;</span>
+      </div>
+    </div>
   </main>
 
   <main id="loggedInScreen" class="logged-in hidden">
@@ -3369,14 +4228,28 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       </div>
       <div class="sub-header-row">
         <div id="speciesFilterBar" class="species-filter-bar hidden" aria-label="Filter postcards"></div>
-        <button type="button" id="carouselViewBtn" class="btn btn-tv carousel-view-btn" title="Carousel of Postcards" aria-label="Carousel of Postcards">
-          <svg class="tv-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-            <path fill="currentColor" d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/>
-            <rect x="6" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
-            <rect x="10.5" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
-            <rect x="15" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
-          </svg>
-        </button>
+        <div class="sub-header-view-actions">
+          <button type="button" id="carouselViewBtn" class="btn btn-tv carousel-view-btn" title="Carousel of Postcards" aria-label="Carousel of Postcards">
+            <svg class="tv-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path fill="currentColor" d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z"/>
+              <rect x="6" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
+              <rect x="10.5" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
+              <rect x="15" y="8.6" width="3" height="4.8" rx="0.6" fill="currentColor"/>
+            </svg>
+          </button>
+          <label class="postcard-sort-select-wrap" title="Sort the current postcard view">
+            <span class="sr-only">Sort postcards</span>
+            <select id="postcardSortSelect" class="postcard-sort-select" aria-label="Sort postcards" hidden>
+              <option value="">SORT</option>
+              <option value="newest">NEWEST</option>
+              <option value="oldest">OLDEST</option>
+              <option value="most">MOST</option>
+              <option value="least">LEAST</option>
+              <option value="birds">BIRDS</option>
+              <option value="assets">ASSETS</option>
+            </select>
+          </label>
+        </div>
       </div>
     </header>
     <div class="media-area">
@@ -3414,7 +4287,38 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     </div>
   </div>
 
-  <div id="getbirdsTvOverlay" class="getbirds-tv-overlay hidden" aria-label="GetBirds.TV broadcast">
+
+  <div id="birdBuddyAssetModalOverlay" class="modal-overlay hidden" aria-modal="true" aria-label="BirdBuddy asset preview results">
+    <div class="modal asset-bucket-modal">
+      <button type="button" class="modal-close" id="birdBuddyAssetModalClose" aria-label="Close">×</button>
+      <div class="asset-bucket-body">
+        <div id="birdBuddyAssetGrid" class="asset-bucket-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="ufoDetectModalOverlay" class="modal-overlay hidden" aria-modal="true" aria-labelledby="ufoDetectModalTitle">
+    <div class="modal ufo-detect-modal">
+      <button type="button" class="modal-close" id="ufoDetectModalClose" aria-label="Close">×</button>
+      <div class="ufo-detect-body">
+        <div class="ufo-detect-hero">
+          <div class="ufo-detect-mascot-wrap">
+            <img id="ufoDetectMascot" class="ufo-detect-mascot" alt="Mystery Visitor" />
+          </div>
+          <div class="ufo-detect-copy">
+            <div id="ufoDetectModalTitle" class="ufo-detect-kicker">BOGEY!!</div>
+            <p id="ufoDetectModalMessage" class="ufo-detect-message">UFOs detected. Identify?</p>
+          </div>
+        </div>
+        <div class="ufo-detect-actions">
+          <button type="button" id="ufoDetectNo" class="btn ufo-no">NO</button>
+          <button type="button" id="ufoDetectYes" class="btn btn-primary">YES</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="getbirdsTvOverlay" class="getbirds-tv-overlay hidden" aria-label="Carousel of Birdos broadcast">
     <div class="getbirds-tv-stage">
       <div id="getbirdsTvPrevPanel" class="getbirds-tv-panel getbirds-tv-prev" aria-label="Play previous" role="button" tabindex="0"></div>
       <div class="getbirds-tv-video-wrap">
@@ -3429,8 +4333,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     </div>
     <div class="getbirds-tv-overlays">
       <div id="getbirdsTvLiveBadge" class="getbirds-tv-livebadge hidden" aria-hidden="true"><span class="live-dot"></span>LIVE</div>
-      <div class="getbirds-tv-bug" aria-hidden="true">GetBirds.TV</div>
-      <div class="getbirds-tv-banner" aria-hidden="true">GetBirds.TV by HH5HH</div>
+      <div class="getbirds-tv-bug" aria-hidden="true">Carousel of Birdos</div>
+      <div class="getbirds-tv-banner" aria-hidden="true">Carousel of Birdos by HH5HH</div>
       <div id="getbirdsTvLowerThird" class="getbirds-tv-lower-third" aria-hidden="true"></div>
       <div id="getbirdsTvSnipe" class="getbirds-tv-snipe" aria-hidden="true"></div>
     </div>
@@ -3441,7 +4345,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 16V8m0 0l-3.2 3.2M12 8l3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <span class="getbirds-tv-send-batch-count" id="getbirdsTvSendBatchCount">0</span>
     </button>
-    <button type="button" id="getbirdsTvClose" class="getbirds-tv-close" aria-label="Close GetBirds.TV">×</button>
+    <button type="button" id="getbirdsTvClose" class="getbirds-tv-close" aria-label="Close Carousel of Birdos">×</button>
   </div>
 
   <script>
@@ -3486,7 +4390,6 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   /* BirdBuddy token considered stale this many ms before expiry (refresh proactively). */
   const BB_TOKEN_STALE_MS = 2 * 60 * 1000;
   const UNKNOWN_SPECIES_LABEL = "Unknown Birdo";
-  const SPECIES_FILTER_IDENTIFIED = "Identified only";
   const SPECIES_FILTER_NOT_COLLECTED = "__not_collected__";
   const LEGACY_SPECIES_FILTER_UNKNOWN = "Unknown";
 
@@ -3515,8 +4418,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     '    feed(first: $first, after: $after, filter: $filter) {',
     '      edges { cursor node {',
     '        __typename',
-    '        ... on FeedItemNewPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName } } sightingReportPreview { sightings { __typename ... on SightingRecognizedBird { species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } } ... on SightingRecognizedBirdUnlocked { species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } } } } }',
-    '        ... on FeedItemCollectedPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName } } species { id name scientificName } }',
+    '        ... on FeedItemNewPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName iconUrl } } sightingReportPreview { sightings { __typename ... on SightingRecognizedBird { species { __typename ... on SpeciesBird { id name scientificName iconUrl } ... on SpeciesBirdFamily { id name iconUrl } ... on SpeciesBirdGenus { id name iconUrl } ... on SpeciesBirdOrder { id name iconUrl } } } ... on SightingRecognizedBirdUnlocked { species { __typename ... on SpeciesBird { id name scientificName iconUrl } ... on SpeciesBirdFamily { id name iconUrl } ... on SpeciesBirdGenus { id name iconUrl } ... on SpeciesBirdOrder { id name iconUrl } } } } } }',
+    '        ... on FeedItemCollectedPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName iconUrl } } species { id name scientificName } }',
     '      } }',
     '      pageInfo { hasNextPage endCursor }',
     '    }',
@@ -3530,8 +4433,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     '    feed(first: $first, after: $after, filter: $filter) {',
     '      edges { cursor node {',
     '        __typename',
-    '        ... on FeedItemNewPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName } } }',
-    '        ... on FeedItemCollectedPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName } } species { id name scientificName } }',
+    '        ... on FeedItemNewPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName iconUrl } } }',
+    '        ... on FeedItemCollectedPostcard { id createdAt expiresAt medias { __typename id thumbnailUrl ... on MediaImage { contentUrl(size: ORIGINAL) } ... on MediaVideo { contentUrl(size: ORIGINAL) } } mediaSpeciesAssignedName { name species { id name scientificName iconUrl } } species { id name scientificName } }',
     '      } }',
     '      pageInfo { hasNextPage endCursor }',
     '    }',
@@ -3558,6 +4461,11 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const loginScreen = $("loginScreen");
   const loggedInScreen = $("loggedInScreen");
   const loginBtn = $("loginBtn");
+  const loginAssetWall = $("loginAssetWall");
+  const noCameraGate = $("noCameraGate");
+  const noCameraGateAvatar = $("noCameraGateAvatar");
+  const noCameraGateAvatarWrap = $("noCameraGateAvatarWrap");
+  const noCameraGateMascot = $("noCameraGateMascot");
   const avatar = $("avatar");
   const avatarWrap = $("avatarWrap");
   const communityBtn = $("communityBtn");
@@ -3582,6 +4490,19 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   const youtubeModalOpenStudio = $("youtubeModalOpenStudio");
   const onCameraFeedBtn = $("onCameraFeedBtn");
   const carouselViewBtn = $("carouselViewBtn");
+  const postcardSortSelect = $("postcardSortSelect");
+  const birdBuddyAssetModalOverlay = $("birdBuddyAssetModalOverlay");
+  const birdBuddyAssetModalClose = $("birdBuddyAssetModalClose");
+  const birdBuddyAssetStatus = $("birdBuddyAssetStatus");
+  const ufoDetectModalOverlay = $("ufoDetectModalOverlay");
+  const ufoDetectModalClose = $("ufoDetectModalClose");
+  const ufoDetectModalMessage = $("ufoDetectModalMessage");
+  const ufoDetectMascot = $("ufoDetectMascot");
+  const ufoDetectNo = $("ufoDetectNo");
+  const ufoDetectYes = $("ufoDetectYes");
+  const birdBuddyAssetGrid = $("birdBuddyAssetGrid");
+  const birdBuddyAssetSearch = $("birdBuddyAssetSearch");
+  const birdBuddyAssetType = $("birdBuddyAssetType");
   const getbirdsLiveBtn = $("getbirdsLiveBtn");
   const getbirdsTvOverlay = $("getbirdsTvOverlay");
   const getbirdsTvVideo = $("getbirdsTvVideo");
@@ -3659,6 +4580,17 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   var speciesQueryMode = "species";
   var deferSpeciesFilterRefresh = false;
   var speciesFilterRefreshPending = false;
+  // Postcard sort is a view preference: null = natural feed order, most = most photos first, least = least photos first.
+  var postcardSortMode = "";
+  var birdsOnlyFilter = false;
+  var fullCameraPullActive = false;
+  var firstLoginUnknownPromptPending = false;
+  var activeGoogleProfile = null;
+  var noCameraGateOpen = false;
+  // Embedded Mystery Visitor mascot; keeps the entire UFO prompt portable as one PHP file.
+  const UFO_MYSTERY_VISITOR_DATA_URI = "data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMzAwIDMwMCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xNjcuNSAyMS44NjcxQzE1My42MzEgMjUuODUyMSAxNDEuMzI2IDM1Ljc1NTEgMTM2LjAyMyA0Ny4xOTgxQzEzNC4zMTkgNTAuODc2MSAxMzEuODE2IDU5Ljc0MDEgMTMwLjAxMiA2OC40ODcxQzEyOC4zMTEgNzYuNzMwMSAxMjYuMjEzIDg0LjU1MzEgMTI1LjM0OCA4NS44NzIxQzEyNC40ODQgODcuMTkxMSAxMTkuNjI1IDkyLjQzNTEgMTE0LjU1IDk3LjUyNzFDOTguNTQ2MSAxMTMuNTgzIDkxLjI2ODEgMTI2LjkyMSA3Mi4yNzUxIDE3NUM1OC4zNDgxIDIxMC4yNTMgNTcuNDMzMSAyMTIuNzY2IDU4LjIyNTEgMjEzLjU1OEM1OC45NTIxIDIxNC4yODYgNzEuODY4MSAyMDguNDI5IDc0LjIxMDEgMjA2LjMxQzc3LjgxNjEgMjAzLjA0NiA3Ny4wODQxIDIwNi4wMiA3Mi41NTkxIDIxMy4wMTRDNjYuODM4MSAyMjEuODU4IDU2LjQyNzEgMjM1LjgxNSA0NS45NTQxIDI0OC42ODFDMzYuODkwMSAyNTkuODE1IDM0LjY3NjEgMjY0LjU1OSAzNy41NTkxIDI2Ni42NjdDNDAuMTUxMSAyNjguNTYyIDQ3Ljc5MTEgMjY4LjI3OCA1Mi41NjgxIDI2Ni4xMDhDNTYuMDA0MSAyNjQuNTQ4IDU2LjkxODEgMjY0LjQ2NyA1OC40NDcxIDI2NS41ODVDNTkuOTgwMSAyNjYuNzA2IDYwLjgxNDEgMjY2LjYyMSA2My44NzkxIDI2NS4wMzFDNjguNDcxMSAyNjIuNjQ5IDc4Ljk1NzEgMjUxLjg0NCA4Ni43MTcxIDI0MS41Qzk1LjAwOTEgMjMwLjQ0NSAxMDMuOTI1IDIxOS42NDggMTA1LjUwMSAyMTguNzUxQzEwNy4xMTkgMjE3LjgzMSAxMTguODY1IDIyMi45ODkgMTIxLjEyNiAyMjUuNjEzQzEyMi4wMjEgMjI2LjY1MSAxMjUuMzY1IDIzNC42MzMgMTI4LjU1NyAyNDMuMzUxQzEzNS42NDUgMjYyLjcwNCAxMzUuNjYyIDI2Mi42MjYgMTI0LjI4IDI2Mi4yMDdDMTE3LjgwMSAyNjEuOTY5IDExNS45MzQgMjYyLjI0NyAxMTQuMjA2IDI2My43MDdDMTA5LjEzMiAyNjcuOTk2IDExMS45MDIgMjY4Ljg3IDEzMi4wNzMgMjY5LjM0NUMxMzcuNjM4IDI2OS40NzYgMTM5LjIyNiAyNjkuOTQxIDE0Mi40MjUgMjcyLjM3OEMxNDQuNTAzIDI3My45NjIgMTQ4LjEzNyAyNzUuODM5IDE1MC40OTkgMjc2LjU1QzE1Mi44NjIgMjc3LjI2MSAxNTYuMjA0IDI3OC41NzEgMTU3LjkyNyAyNzkuNDYyQzE2MS4zODMgMjgxLjI1IDE2MyAyODAuODE0IDE2MyAyNzguMDk2QzE2MyAyNzUuODU2IDE2MC4wODYgMjczLjE2NSAxNTYuMzU3IDI3MS45NjNDMTU0LjMwNyAyNzEuMzAyIDE1NS4zMzYgMjcxLjIwOSAxNjAgMjcxLjYzMkMxNjMuNTc1IDI3MS45NTYgMTY4LjAxNyAyNzIuODQ2IDE2OS44NzIgMjczLjYxQzE3NC41NDEgMjc1LjUzNCAxNzUgMjc1LjQwMSAxNzUgMjcyLjEyMkMxNzUgMjY3LjU0NCAxNzIuODQ0IDI2Ni42MDcgMTYwLjkxIDI2NS45OTVDMTQ4LjIxNyAyNjUuMzQ1IDE0Ni4wODUgMjY0LjI1NyAxNDEuNjk4IDI1Ni4xOTNDMTM4Ljk1NSAyNTEuMTUxIDEzNCAyMzMuOTYgMTM0IDIyOS40ODVDMTM0IDIyNi44OTUgMTM1Ljg4NyAyMjYuNDcyIDE1MiAyMjUuNDU3TDE2MS41IDIyNC44NTlMMTcwLjMxMyAyMzguMzExQzE3NS4xNiAyNDUuNzA5IDE3OS4zNzIgMjUyLjcwOCAxNzkuNjc1IDI1My44NjRDMTgwLjQ2MSAyNTYuODcgMTc1Ljg0OSAyNTguNTU2IDE3MC44ODQgMjU3LjA3N0MxNjUuODAxIDI1NS41NjMgMTYwLjQ2MiAyNTUuNzM4IDE1OS4wMjggMjU3LjQ2NkMxNTYuOTUxIDI1OS45NjkgMTU4LjM4MiAyNjEuMjMzIDE2My41NCAyNjEuNDUyQzE3My43ODYgMjYxLjg4NiAyMDQuMzAyIDI2OC4xMDkgMjEzLjUwNSAyNzEuNjRDMjE1LjY3MiAyNzIuNDcyIDIxNS4zNzkgMjY5LjY1MyAyMTMuMDgxIDI2Ny41NzNDMjEyLjAyNiAyNjYuNjE4IDIwOS4yMTMgMjY1LjE5IDIwNi44MzEgMjY0LjM5OUwyMDIuNSAyNjIuOTYyTDIwOS44NDkgMjYzLjQzMUMyMTQuMjY4IDI2My43MTMgMjE4LjE5OSAyNjQuNTU2IDIxOS43MDYgMjY1LjU0M0MyMjIuNDY2IDI2Ny4zNTIgMjI0LjcwMyAyNjYuMjc0IDIyMy42ODcgMjYzLjYyNUMyMjIuNTYgMjYwLjY4OSAyMTcuODg3IDI1OC43NDUgMjA5LjczOSAyNTcuODIyQzE5My45MzYgMjU2LjAzMSAxOTEuMzU1IDI1NS4yMzQgMTg3Ljc3IDI1MS4wMzRDMTg0LjIzNyAyNDYuODk0IDE3MyAyMjYuMjAyIDE3MyAyMjMuODM1QzE3MyAyMjMuMDQgMTc2LjQ1NCAyMjAuNDU4IDE4MC42NzUgMjE4LjA5N0MyMDEuODYgMjA2LjI0OSAyMTcuMTU1IDE4OC45OTQgMjI1LjE2NyAxNjkuOTI1QzIzMC4xNjggMTU4LjAyMSAyMzMuMjMzIDE0My44MDYgMjMzLjM0MyAxMzJDMjMzLjQ3MSAxMTguNDE4IDIzMS4zNTMgMTEwLjAyNyAyMjQuMzg4IDk2LjUwNTFDMjIxLjMwOSA5MC41MjkxIDIyMCA4NC43MjkxIDIyMCA4Mi45NzMxQzIyMCA3OC45OTMxIDIyMi4xNjkgNzQuODc3MSAyMjUuOTM5IDcxLjcwNTFDMjI5LjI3OSA2OC44OTQxIDI0MC4xNjEgNjYuMDAwMSAyNDcuMzg4IDY2LjAwMDFDMjUzLjExOSA2Ni4wMDAxIDI1My45NDIgNjQuNTkzMSAyNTAuMzgzIDYwLjg3ODFDMjQ3LjA1OCA1Ny40MDcxIDI0Mi40NDQgNTQuNzI3MSAyMzEuNjI4IDQ5Ljk4NDFDMjI0LjYyOCA0Ni45MTQxIDIyMy4zMzEgNDUuOTA2MSAyMTkuOTE2IDQwLjg3NjFDMjA4LjM2NSAyMy44NjcxIDE4Ny4yMjIgMTYuMTk5MSAxNjcuNSAyMS44NjcxWk0xNzcuNTMgOTIuNDQ4MUMxNzkuMjQzIDkzLjE2NDEgMTgyLjMyNyA5NS4yMjYxIDE4NC4zODIgOTcuMDMwMUMxOTYuMjA1IDEwNy40MTEgMTk0LjIwNyAxMjMuMjUyIDE3OS4wMzcgMTM5LjQwM0MxNjkuNzM5IDE0OS4zMDMgMTY4LjAzOSAxNTIuMDcgMTY2Ljg5OCAxNTkuMTU0QzE2NS42NjMgMTY2LjgxOCAxNjUuNTUgMTY3IDE2MS45NzYgMTY3QzE1Ny44MiAxNjcgMTU2LjYxNCAxNjQuMTM5IDE1Ny4zMDQgMTU1LjkxMUMxNTguMDA2IDE0Ny41MzUgMTYwLjE3NyAxNDMuMjEzIDE2OC4wNDMgMTM0LjUzM0MxNzUuNTIgMTI2LjI4MyAxNzcuOTQ5IDEyMS4yOTIgMTc3Ljk3OCAxMTQuMTE4QzE3OC4wMjUgMTAyLjU2OCAxNjguMjI2IDk1LjkxNDEgMTU3LjcxOCAxMDAuMzYyQzE1MS40NDMgMTAzLjAxOCAxNDkuNzk5IDEwNi41MjYgMTUxLjMwNSAxMTQuMDQ5QzE1Mi4xNDcgMTE4LjI1NiAxNTAuNzM2IDEyMC41OTMgMTQ2Ljc3NSAxMjEuNTQ3QzE0NC41ODQgMTIyLjA3NiAxNDMuNDU4IDEyMS42MTIgMTQxLjAyNSAxMTkuMTc5QzEzMy44OSAxMTIuMDQ0IDEzOS42OTkgOTcuNTI1MSAxNTEuNTA0IDkyLjk4NTFDMTU5LjU0NiA4OS44OTMxIDE3MC44NTYgODkuNjYwMSAxNzcuNTMgOTIuNDQ4MVpNMTY3LjA3NyAxNzkuOTIzQzE3MC40OTMgMTgzLjM0IDE3MC43NSAxODYuMjU3IDE2OC4wMjcgMTkwLjcyM0MxNjMuMzE0IDE5OC40NTMgMTUzIDE5NC44NSAxNTMgMTg1LjQ3M0MxNTMgMTgxLjk5MiAxNTguMDA4IDE3NyAxNjEuNSAxNzdDMTYzLjEgMTc3IDE2NS4zMTUgMTc4LjE2MSAxNjcuMDc3IDE3OS45MjNaIiBmaWxsPSIjMDAzMzMzIi8+Cjwvc3ZnPgo=";
+  var ufoPromptOpen = false;
+  var ufoPromptHandled = false;
 
   function parseRetryAfterSeconds(retryAfterValue) {
     var raw = String(retryAfterValue || "").trim();
@@ -3855,7 +4787,15 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
 
   function isElementVisible(el) {
-    return !!(el && !el.hidden && el.style.display !== "none");
+    if (!el || el.hidden) return false;
+    var node = el;
+    while (node && node.nodeType === 1) {
+      if (node.hidden || node.style.display === "none") return false;
+      var cs = window.getComputedStyle(node);
+      if (cs.display === "none" || cs.visibility === "hidden" || cs.visibility === "collapse") return false;
+      node = node.parentElement;
+    }
+    return true;
   }
 
   function getDisplayedCounts() {
@@ -3873,6 +4813,298 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       media += group.querySelectorAll(".media-link").length;
     });
     return { postcards: postcards, media: media };
+  }
+
+  function getPostcardPhotoCount(postcardOrGroup) {
+    if (!postcardOrGroup) return 0;
+    if (postcardOrGroup.medias && Array.isArray(postcardOrGroup.medias)) {
+      return postcardOrGroup.medias.reduce(function (count, m) { return count + (m && !m.isVideo ? 1 : 0); }, 0);
+    }
+    return postcardOrGroup.querySelectorAll ? postcardOrGroup.querySelectorAll(".media-card img").length : 0;
+  }
+
+  function getPostcardVideoCount(postcardOrGroup) {
+    if (!postcardOrGroup) return 0;
+    if (postcardOrGroup.medias && Array.isArray(postcardOrGroup.medias)) {
+      return postcardOrGroup.medias.reduce(function (count, m) { return count + (m && m.isVideo ? 1 : 0); }, 0);
+    }
+    return postcardOrGroup.querySelectorAll ? postcardOrGroup.querySelectorAll(".media-card video").length : 0;
+  }
+
+  function getSortablePostcardGroups() {
+    if (!mediaGrid || (feedMode === "community" && communityLevel === "species")) return [];
+    return Array.prototype.slice.call(mediaGrid.querySelectorAll(".postcard-group"));
+  }
+
+  function updatePostcardSortPicker() {
+    if (!postcardSortSelect) return;
+    var applicable = getSortablePostcardGroups().length >= 1 && !(feedMode === "community" && communityLevel === "species");
+    postcardSortSelect.hidden = !applicable;
+    if (postcardSortSelect.parentElement) postcardSortSelect.parentElement.hidden = !applicable;
+    if (!applicable) return;
+    postcardSortSelect.value = postcardSortMode || "";
+    postcardSortSelect.dataset.active = postcardSortMode ? "true" : "false";
+    var labels = { "":"SORT", newest:"NEWEST", oldest:"OLDEST", most:"MOST", least:"LEAST", birds:"BIRDS", assets:"ASSETS" };
+    postcardSortSelect.title = postcardSortMode ? (labels[postcardSortMode] + " active") : "Choose a sort/filter";
+  }
+
+  function isBirdLikeSpeciesName(name, typename) {
+    var t = String(typename || "").trim();
+    if (/^SpeciesBird(?:Family|Genus|Order)?$/i.test(t)) return true;
+    if (/^Species(?:Animal|Mammal|Reptile|Insect|Rodent)/i.test(t)) return false;
+    var s = String(name || "").trim().toLowerCase();
+    if (!s || isUnknownSpeciesLabel(s)) return true;
+    return !(/squirrel|chipmunk|rodent|mouse|rat|rabbit|raccoon|opossum|skunk|cat|dog|deer|bear|fox|bat|lizard|snake|turtle|frog|toad|butterfly|moth|bee|wasp|ant|dragonfly|cricket|chipmunk/i.test(s));
+  }
+
+  function postcardContainsBird(postcard) {
+    if (!postcard) return false;
+    var details = getSpeciesDetails(postcard);
+    if (details.length) return details.some(function (d) { return isBirdLikeSpeciesName(d.name, d.typename); });
+    return getCanonicalSpeciesList(postcard).some(function (name) { return isBirdLikeSpeciesName(name, ""); });
+  }
+
+  function applyBirdOnlyFilter() {
+    if (!mediaGrid) return;
+    mediaGrid.querySelectorAll(".postcard-group").forEach(function (group) {
+      var postcard = findPostcardById(group.getAttribute("data-postcard-id") || "");
+      if (!birdsOnlyFilter) return;
+      group.style.display = postcardContainsBird(postcard) ? "" : "none";
+    });
+  }
+
+  function applyPostcardSort() {
+    if (!mediaGrid) return;
+    var groups = getSortablePostcardGroups();
+    if (!groups.length) { updatePostcardSortPicker(); return; }
+    var decorated = groups.map(function (group, index) {
+      var id = group.getAttribute("data-postcard-id") || "";
+      var postcard = findPostcardById(id);
+      var created = postcard ? new Date(postcard.createdAt || "").getTime() : 0;
+      var natural = parseInt(group.getAttribute("data-natural-order") || String(index), 10);
+      return { group: group, index: index, natural: isFinite(natural) ? natural : index, photos: postcard ? getPostcardPhotoCount(postcard) : getPostcardPhotoCount(group), created: isFinite(created) ? created : 0, bird: postcardContainsBird(postcard) };
+    });
+    if (!postcardSortMode || postcardSortMode === "assets") {
+      decorated.sort(function (a, b) { return a.natural - b.natural; });
+    } else {
+      decorated.sort(function (a, b) {
+        if (postcardSortMode === "birds") { if (a.bird !== b.bird) return a.bird ? -1 : 1; return a.natural - b.natural; }
+        if (postcardSortMode === "newest" || postcardSortMode === "oldest") {
+          if (a.created !== b.created) return postcardSortMode === "newest" ? b.created - a.created : a.created - b.created;
+          return a.natural - b.natural;
+        }
+        if (a.photos !== b.photos) return postcardSortMode === "most" ? b.photos - a.photos : a.photos - b.photos;
+        return a.natural - b.natural;
+      });
+    }
+    var fragment = document.createDocumentFragment();
+    decorated.forEach(function (entry) { fragment.appendChild(entry.group); });
+    mediaGrid.appendChild(fragment);
+    applyBirdOnlyFilter();
+    updatePostcardSortPicker();
+  }
+
+  // ========================================================================
+  // BirdBuddy ASSETS browser
+  // This intentionally mirrors the proven standalone preview-grid data path:
+  // GET the public S3/XML bucket, parse <Key> values, render immediately, then
+  // advance with start-after=<last returned key>. The popup is results-only.
+  // ========================================================================
+  const BIRDBUDDY_ASSET_BUCKET = "https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com/";
+  const BIRDBUDDY_ASSET_PROXY = "./gbirds.php?api=birdbuddy-assets-xml&max_keys=1000";
+  const BIRDBUDDY_ASSET_CACHE_KEY = "getbirds_birdbuddy_assets_v3";
+
+  var birdBuddyAssetManifest = null;
+  var birdBuddyAssetKeys = [];
+  var birdBuddyAssetModalOpen = false;
+  var birdBuddyAssetLoading = false;
+  var birdBuddyAssetStartAfter = "";
+  var birdBuddyAssetFinished = false;
+  var birdBuddyAssetUsingProxy = false;
+  var birdBuddyAssetPageCount = 0;
+
+  function assetInfoFromKey(key) {
+    var raw = String(key || "").trim();
+    var parts = raw ? raw.split("/").filter(Boolean) : [];
+    var filename = parts.length ? parts[parts.length - 1] : raw;
+    var extensionMatch = filename.match(/\.([^.]+)$/);
+    var format = extensionMatch ? extensionMatch[1].toUpperCase() : "FILE";
+    var type = parts.length > 1 ? parts[1] : "root";
+    var subpath = parts.length > 2 ? parts.slice(2, -1).join(" /") : "";
+    var previewable = /\.(png|jpe?g|gif|webp|svg|avif)$/i.test(filename);
+    var url = BIRDBUDDY_ASSET_BUCKET + raw.split("/").map(encodeURIComponent).join("/");
+    var downloadUrl = "./gbirds.php?api=birdbuddy-asset-download&key=" + encodeURIComponent(raw);
+    var label = filename.replace(/_thumbnail\.(png|jpe?g|svg|webp)$/i, "").replace(/_/g, " ");
+    return { key:raw, filename:filename || "(unnamed asset)", label:label || filename || "(unnamed asset)", format:format, type:type, subpath:subpath, previewable:previewable, url:url, downloadUrl:downloadUrl };
+  }
+
+  function makeAssetCard(info) {
+    var card = document.createElement("a");
+    card.className = "asset-bucket-card";
+    card.href = info.downloadUrl;
+    card.setAttribute("download", info.filename);
+    card.setAttribute("aria-label", "Download " + info.filename);
+    if (info.previewable) {
+      var img = document.createElement("img");
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = "";
+      img.src = info.url;
+      var fallback = document.createElement("div");
+      fallback.className = "asset-bucket-filemark";
+      fallback.textContent = "ASSET\n" + info.filename;
+      fallback.style.whiteSpace = "pre-line";
+      fallback.hidden = true;
+      img.addEventListener("error", function () { img.hidden = true; fallback.hidden = false; }, {once:true});
+      card.appendChild(img);
+      card.appendChild(fallback);
+    } else {
+      var mark = document.createElement("div");
+      mark.className = "asset-bucket-filemark";
+      mark.textContent = "ASSET\n" + info.filename;
+      mark.style.whiteSpace = "pre-line";
+      card.appendChild(mark);
+    }
+    var hover = document.createElement("div");
+    hover.className = "asset-bucket-hover";
+    var name = document.createElement("div");
+    name.className = "asset-bucket-name";
+    name.textContent = info.label;
+    hover.appendChild(name);
+    var meta = document.createElement("div");
+    meta.className = "asset-bucket-meta";
+    meta.textContent = [info.format, info.type, info.subpath, info.key].filter(Boolean).join(" • ");
+    hover.appendChild(meta);
+    card.appendChild(hover);
+    return card;
+  }
+
+  function renderBirdBuddyAssetBrowser() {
+    if (!birdBuddyAssetGrid) return;
+    birdBuddyAssetGrid.innerHTML = "";
+    if (!birdBuddyAssetKeys.length) {
+      var empty = document.createElement("div");
+      empty.className = "asset-bucket-empty";
+      empty.textContent = birdBuddyAssetLoading ? "Loading BirdBuddy assets…" : "No BirdBuddy assets returned.";
+      birdBuddyAssetGrid.appendChild(empty);
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    birdBuddyAssetKeys.forEach(function (key) { frag.appendChild(makeAssetCard(assetInfoFromKey(key))); });
+    birdBuddyAssetGrid.appendChild(frag);
+  }
+
+  function parseBirdBuddyAssetXml(xmlText) {
+    var doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    if (!doc || doc.querySelector("parsererror")) throw new Error("Could not parse BirdBuddy asset XML.");
+    var keyNodes = Array.prototype.slice.call(doc.getElementsByTagNameNS("*", "Key"));
+    var keys = keyNodes.map(function (node) { return String(node.textContent || "").trim(); }).filter(Boolean);
+    var truncNode = doc.getElementsByTagNameNS("*", "IsTruncated")[0];
+    var truncated = !!truncNode && String(truncNode.textContent || "").trim().toLowerCase() === "true";
+    return { keys: keys, isTruncated: truncated, source: "server-proxy-xml" };
+  }
+
+  function fetchBirdBuddyAssetXmlPage(marker) {
+    var url = BIRDBUDDY_ASSET_PROXY;
+    if (marker) url += "&marker=" + encodeURIComponent(marker);
+    return fetch(url, { credentials:"same-origin", cache:"no-store", headers:{"Accept":"application/xml,text/xml,*/*"} })
+      .then(function (r) { if (!r.ok) throw new Error("BirdBuddy asset bucket HTTP " + r.status); return r.text(); })
+      .then(parseBirdBuddyAssetXml);
+  }
+
+  function loadAllBirdBuddyAssetsIntoBrowser() {
+    if (birdBuddyAssetLoading) return Promise.resolve();
+    birdBuddyAssetLoading = true;
+    birdBuddyAssetFinished = false;
+    birdBuddyAssetUsingProxy = true;
+    birdBuddyAssetPageCount = 0;
+    birdBuddyAssetKeys = [];
+    birdBuddyAssetStartAfter = "";
+    renderBirdBuddyAssetBrowser();
+
+    function pageLoop(marker) {
+      return fetchBirdBuddyAssetXmlPage(marker || "").then(function (page) {
+        var incoming = Array.isArray(page.keys) ? page.keys : [];
+        var seen = Object.create(null);
+        birdBuddyAssetKeys.forEach(function (k) { seen[k] = true; });
+        var added = 0, lastNewKey = "";
+        incoming.forEach(function (k) {
+          k = String(k || "").trim();
+          if (!k || seen[k]) return;
+          seen[k] = true;
+          birdBuddyAssetKeys.push(k);
+          lastNewKey = k;
+          added += 1;
+        });
+        birdBuddyAssetPageCount += 1;
+        birdBuddyAssetStartAfter = lastNewKey || marker || "";
+        renderBirdBuddyAssetBrowser();
+        if (!page.isTruncated || !lastNewKey) {
+          birdBuddyAssetFinished = true;
+          return null;
+        }
+        return pageLoop(lastNewKey);
+      });
+    }
+
+    return pageLoop("").finally(function () {
+      birdBuddyAssetLoading = false;
+      renderBirdBuddyAssetBrowser();
+    });
+  }
+
+  function openBirdBuddyAssetBrowser() {
+    if (!birdBuddyAssetModalOverlay || birdBuddyAssetModalOpen) return;
+    birdBuddyAssetModalOpen = true;
+    birdBuddyAssetModalOverlay.classList.remove("hidden");
+    loadAllBirdBuddyAssetsIntoBrowser().catch(function (e) {
+      if (!birdBuddyAssetGrid) return;
+      birdBuddyAssetGrid.innerHTML = "";
+      var d = document.createElement("div");
+      d.className = "asset-bucket-empty";
+      d.textContent = (e && e.message) || "Could not load the BirdBuddy asset bucket.";
+      birdBuddyAssetGrid.appendChild(d);
+    });
+  }
+
+  function closeBirdBuddyAssetBrowser() {
+    birdBuddyAssetModalOpen = false;
+    if (birdBuddyAssetModalOverlay) birdBuddyAssetModalOverlay.classList.add("hidden");
+  }
+
+  function showCameraPullStatus(detail) {
+    if (!mediaStatus) return;
+    mediaStatus.className = "media-loading firebird-feed-status";
+    mediaStatus.innerHTML = "";
+    var spinner = document.createElement("div");
+    spinner.className = "firebird-spinner firebird-feed-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    var trail = document.createElement("div");
+    trail.className = "firebird-trail";
+    var bird = document.createElement("div");
+    bird.className = "firebird-emoji";
+    bird.innerHTML = '<svg viewBox="0 0 200 100" width="72" height="36" aria-hidden="true"><defs><linearGradient id="cameraFirebirdGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ffe14d"/><stop offset="50%" stop-color="#ff8a1a"/><stop offset="100%" stop-color="#ff3b30"/></linearGradient></defs><path fill="url(#cameraFirebirdGrad)" stroke="#fff4d6" stroke-width="1.5" stroke-linejoin="round" d="M100,6 L110,16 L145,20 L104,24 L100,30 L196,42 L185,50 L170,46 L160,58 L150,50 L140,60 L130,52 L120,62 L112,54 L104,64 L118,96 L100,78 L82,96 L96,64 L88,54 L80,62 L70,52 L60,60 L50,50 L40,58 L30,46 L15,50 L4,42 L100,30 L90,16 Z"/></svg>';
+    spinner.appendChild(trail);
+    spinner.appendChild(bird);
+    mediaStatus.appendChild(spinner);
+    var title = document.createElement("div");
+    title.textContent = "Pulling all postcards from your camera...";
+    mediaStatus.appendChild(title);
+    if (detail) {
+      var sub = document.createElement("div");
+      sub.className = "firebird-feed-sub";
+      sub.textContent = detail;
+      mediaStatus.appendChild(sub);
+    }
+    mediaStatus.hidden = false;
+  }
+
+  function finishCameraPullStatus(message, isError) {
+    fullCameraPullActive = false;
+    if (mediaStatus) mediaStatus.hidden = true;
+    setBusy(false);
+    updateFooter();
+    if (message) setHeaderStatus(message, !!isError, { persist: false });
   }
 
   // "Postcards on {camera.name}" — reflects whichever camera the on-camera
@@ -3898,21 +5130,40 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   // postcard is still showing its own WHO DAT?!? button (i.e. genuinely
   // unidentified and eligible) — same eligibility rules as the per-postcard
   // button, just read back from the DOM rather than re-derived here.
+  function isWhoDatButtonCurrentlyVisible(button) {
+    if (!button || !isElementVisible(button)) return false;
+    if (button.getAttribute("data-whodat-batch-processed") === "1") return false;
+    var group = button.closest ? button.closest(".postcard-group") : null;
+    return !!(group && isElementVisible(group));
+  }
+
+  function getVisibleWhoDatButtons() {
+    if (!mediaGrid) return [];
+    var out = [];
+    mediaGrid.querySelectorAll('[data-whodat-button="true"]').forEach(function (button) {
+      if (isWhoDatButtonCurrentlyVisible(button)) out.push(button);
+    });
+    return out;
+  }
+
   function updateWhoDemButtonVisibility() {
     if (!whoDemBtn) return;
-    var hasUnidentified = !!(mediaGrid && mediaGrid.querySelector('[data-whodat-button="true"]'));
-    whoDemBtn.hidden = !hasUnidentified;
+    // WHO DEM?!? is available exactly when at least one eligible WHO DAT target
+    // is currently visible under the active filters.
+    whoDemBtn.hidden = getVisibleWhoDatButtons().length === 0;
   }
 
   function updateFooter() {
     updateOnCameraFeedButtonLabel();
     updateWhoDemButtonVisibility();
+    applyPostcardSort();
     refreshSpeciesFilterBar();
     var visible = getVisibleCounts();
     var total = getDisplayedCounts();
     if (footerStats) {
       footerStats.innerHTML = visible.postcards + " postcard" + (visible.postcards === 1 ? "" : "s") + " displayed" + (visible.media > 0 ? " <span class=\"muted\">(" + visible.media + " media)</span>" : "");
     }
+    updatePostcardSortPicker();
     if (footerActions && loadMoreBtn && loadAllBtn && downloadAllMediaBtn) {
       if (hasMore) {
         loadMoreBtn.hidden = false;
@@ -4151,17 +5402,112 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     applySpeciesFilter();
   }
 
-  /** One entry per unique species (postcards can have multiple comma-separated species). */
+  function getSpeciesDetails(postcard) {
+    var detailed = postcard && Array.isArray(postcard.speciesDetailed) ? postcard.speciesDetailed : [];
+    var seen = {};
+    var out = [];
+    detailed.forEach(function (d) {
+      if (!d || typeof d !== "object") return;
+      var name = canonicalizeSpeciesLabel(d.name || d.scientificName || "");
+      if (!name) return;
+      var key = name.toLowerCase();
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({ name: name, scientificName: String(d.scientificName || "").trim(), id: String(d.id || "").trim(), iconUrl: String(d.iconUrl || "").trim() });
+    });
+    if (!out.length) {
+      getCanonicalSpeciesList(postcard).forEach(function (name) {
+        if (!isUnknownSpeciesLabel(name)) out.push({ name: name, scientificName: "", id: "", iconUrl: "" });
+      });
+    }
+    return out;
+  }
+
+  function speciesIconSrc(iconUrl) {
+    var raw = String(iconUrl || "").trim();
+    return raw ? getBirdBuddyMediaProxyUrl(raw) : "";
+  }
+
+  function appendSpeciesIdentity(container, detail, large) {
+    if (!container) return;
+    var wrap = document.createElement("div");
+    wrap.className = "species-identity";
+    var src = speciesIconSrc(detail && detail.iconUrl);
+    if (src) {
+      var img = document.createElement("img");
+      img.className = "species-icon" + (large ? " species-icon-large" : "");
+      img.src = src;
+      img.alt = "";
+      img.loading = "lazy";
+      img.addEventListener("error", function () {
+        var fallback = document.createElement("span");
+        fallback.className = "species-icon-fallback";
+        fallback.textContent = "🐦";
+        img.replaceWith(fallback);
+      });
+      wrap.appendChild(img);
+    } else {
+      var fallback = document.createElement("span");
+      fallback.className = "species-icon-fallback" + (large ? " species-icon-large" : "");
+      fallback.textContent = "🐦";
+      wrap.appendChild(fallback);
+    }
+    var copy = document.createElement("div");
+    copy.className = "species-identity-copy";
+    var name = document.createElement("div");
+    name.className = "species-identity-name";
+    name.textContent = detail && detail.name ? detail.name : UNKNOWN_SPECIES_LABEL;
+    copy.appendChild(name);
+    if (detail && detail.scientificName) {
+      var sci = document.createElement("div");
+      sci.className = "species-identity-sci";
+      sci.textContent = detail.scientificName;
+      copy.appendChild(sci);
+    }
+    wrap.appendChild(copy);
+    container.appendChild(wrap);
+  }
+
+  function buildSpeciesFilterDetail(name) {
+    var target = canonicalizeSpeciesLabel(name);
+    for (var i = 0; i < allPostcards.length; i++) {
+      var details = getSpeciesDetails(allPostcards[i]);
+      for (var j = 0; j < details.length; j++) {
+        if (details[j].name.toLowerCase() === target.toLowerCase()) return details[j];
+      }
+    }
+    return { name: target, scientificName: "", iconUrl: "" };
+  }
+
+  /**
+   * Species represented by postcards in the CURRENT filter context.
+   *
+   * The rail is intentionally data-driven: a species chip exists only when at
+   * least one loaded postcard in the active feed/camera actually has that species.
+   * Unknown Birdo is stricter still and is derived from the same WHO DAT eligibility
+   * predicate used by the per-postcard and WHO DEM controls.
+   */
+  function postcardIsInSpeciesFilterContext(postcard) {
+    if (!postcard) return false;
+    if (feedMode === "community" && communityLevel === "species") return false;
+    if (cameraFilter !== "All") {
+      var postcardCameraId = String(postcard.feederId || "").trim();
+      if (postcardCameraId && postcardCameraId !== String(cameraFilter)) return false;
+    }
+    return true;
+  }
+
+  function getFilterContextPostcards() {
+    return allPostcards.filter(postcardIsInSpeciesFilterContext);
+  }
+
+  /** One entry per unique known species in the CURRENT filter context. */
   function getUniqueSpecies() {
     var set = {};
-    allPostcards.forEach(function (p) {
-      var label = formatSpeciesLabel(p);
-      if (!label || label === "—") {
-        set[UNKNOWN_SPECIES_LABEL] = true;
-        return;
-      }
-      label.split(/\s*,\s*/).forEach(function (part) {
-        var s = part.trim();
+    getFilterContextPostcards().forEach(function (p) {
+      getCanonicalSpeciesList(p).forEach(function (name) {
+        if (isUnknownSpeciesLabel(name)) return;
+        var s = String(name || "").trim();
         if (s) set[s] = true;
       });
     });
@@ -4188,15 +5534,20 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         show = true;
       } else if (speciesFilter === SPECIES_FILTER_NOT_COLLECTED) {
         show = !dataCollected;
-      } else if (speciesFilter === SPECIES_FILTER_IDENTIFIED) {
-        show = speciesList.some(function (name) { return !isUnknownSpeciesLabel(name); });
       } else if (speciesFilter === LEGACY_SPECIES_FILTER_UNKNOWN || isUnknownSpeciesLabel(speciesFilter)) {
-        show = speciesList.length === 0 || speciesList.some(function (name) { return isUnknownSpeciesLabel(name); });
+        // Unknown Birdo is intentionally the WHO DAT?!? target set, not every
+        // historical/collected postcard carrying an unknown species label.
+        var unknownButton = el.querySelector('[data-whodat-button="true"]');
+        show = !!unknownButton;
       } else {
         show = speciesList.indexOf(speciesFilter) !== -1;
       }
       if (show && cameraFilter !== "All") {
         show = dataCameraId === "" || dataCameraId === cameraFilter;
+      }
+      if (show && birdsOnlyFilter) {
+        var postcard = findPostcardById(el.getAttribute("data-postcard-id") || "");
+        show = postcardContainsBird(postcard);
       }
       el.style.display = show ? "" : "none";
       if (show) visibleCount += 1;
@@ -4214,46 +5565,90 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   function buildSpeciesFilterBar() {
     if (!speciesFilterBar) return;
     if (speciesFilter === LEGACY_SPECIES_FILTER_UNKNOWN) speciesFilter = UNKNOWN_SPECIES_LABEL;
-    if (allPostcards.length === 0) {
+    if (allPostcards.length === 0 || (feedMode === "community" && communityLevel === "species")) {
       speciesFilterBar.classList.add("hidden");
       speciesFilterBar.innerHTML = "";
       return;
     }
+
     speciesFilterBar.classList.remove("hidden");
     var unique = getUniqueSpecies();
+    var contextPostcards = getFilterContextPostcards();
+    var hasUnknownEligible = feedMode === "inbox" && contextPostcards.some(function (p) { return isWhoDatEligiblePostcard(p); });
+
+    // If the active chip was made obsolete by identification, camera switching, or
+    // another feed update, fall back to All rather than leaving an invisible filter
+    // selected and showing an empty feed.
+    var selectedStillAvailable = speciesFilter === null || speciesFilter === "All" ||
+      speciesFilter === SPECIES_FILTER_NOT_COLLECTED ||
+      (isUnknownSpeciesLabel(speciesFilter) && hasUnknownEligible) ||
+      (!isUnknownSpeciesLabel(speciesFilter) && unique.some(function (name) {
+        return name.toLowerCase() === String(speciesFilter || "").toLowerCase();
+      }));
+    if (!selectedStillAvailable) speciesFilter = "All";
+
     speciesFilterBar.innerHTML = "";
-    var label = document.createElement("span");
-    label.className = "filter-label";
-    label.textContent = "Filter:";
-    speciesFilterBar.appendChild(label);
-    function addChip(text, value) {
+
+    function addFilterButton(text, value, detail, fallbackIcon) {
       var chip = document.createElement("button");
       chip.type = "button";
+      chip.className = "species-chip";
+      chip.dataset.filter = value;
+
       var isAll = value === "All";
       var isActive = isAll ? (speciesFilter === null || speciesFilter === "All") : (speciesFilter === value);
-      chip.className = "species-chip" + (isActive ? " active" : "");
-      chip.textContent = text;
-      chip.dataset.filter = value;
+      if (isActive) chip.classList.add("active");
+
+      var icon = document.createElement("span");
+      icon.className = "filter-chip-icon";
+      if (detail && detail.iconUrl) {
+        var img = document.createElement("img");
+        img.src = speciesIconSrc(detail.iconUrl);
+        img.alt = "";
+        img.loading = "lazy";
+        img.addEventListener("error", function () { icon.textContent = fallbackIcon || "🐦"; }, { once: true });
+        icon.appendChild(img);
+      } else {
+        icon.textContent = fallbackIcon || "🐦";
+      }
+      chip.appendChild(icon);
+
+      var label = document.createElement("span");
+      label.className = "filter-chip-text";
+      label.textContent = text;
+      chip.appendChild(label);
+
+      chip.title = text;
+      chip.setAttribute("aria-label", (isActive ? "Filter: " : "Select filter: ") + text);
+      chip.setAttribute("aria-pressed", isActive ? "true" : "false");
+
       chip.addEventListener("click", function () {
         speciesFilter = speciesFilter === value ? "All" : value;
         updateFooter();
       });
       speciesFilterBar.appendChild(chip);
     }
+
+    // All / state filters first. These are the deliberate exceptions: the user
+    // can always get back to the complete active feed and to the uncollected set.
+    addFilterButton("All", "All", null, "🐦");
+
     var notCollectedCount = 0;
-    allPostcards.forEach(function (p) {
+    contextPostcards.forEach(function (p) {
       if (!isPostcardCollected(p)) notCollectedCount += 1;
     });
-    addChip("All", "All");
-    addChip("Not Collected (" + notCollectedCount + ")", SPECIES_FILTER_NOT_COLLECTED);
-    var hasUnknown = unique.some(function (name) { return isUnknownSpeciesLabel(name); });
-    if (hasUnknown) {
-      addChip(SPECIES_FILTER_IDENTIFIED, SPECIES_FILTER_IDENTIFIED);
-      addChip(UNKNOWN_SPECIES_LABEL, UNKNOWN_SPECIES_LABEL);
-    }
+    addFilterButton("Not Collected (" + notCollectedCount + ")", SPECIES_FILTER_NOT_COLLECTED, null, "📦");
+
+    // Unknown Birdo MUST use the exact WHO DAT eligibility predicate. This makes the
+    // chip disappear immediately after WHO DAT / WHO DEM resolves the final mystery.
+    var hasUnknownEligible = feedMode === "inbox" && contextPostcards.some(function (p) {
+      return isWhoDatEligiblePostcard(p);
+    });
+    if (hasUnknownEligible) addFilterButton(UNKNOWN_SPECIES_LABEL, UNKNOWN_SPECIES_LABEL, null, "❓");
+
     unique.forEach(function (name) {
       if (isUnknownSpeciesLabel(name)) return;
-      addChip(name, name);
+      addFilterButton(name, name, buildSpeciesFilterDetail(name), "🐦");
     });
   }
 
@@ -4270,6 +5665,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     setFeedSourceActive("inbox");
     allPostcards = [];
     allCameras = [];
+    postcardSortMode = "";
+    birdsOnlyFilter = false;
+    fullCameraPullActive = false;
     cameraFilter = "All";
     speciesFilter = null;
     speciesQueryMode = "species";
@@ -4299,9 +5697,179 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   }
 
   function showLogin() {
+    hideNoCameraGate();
+    activeGoogleProfile = null;
     resetLoggedInUI();
-    if (loggedInScreen) loggedInScreen.classList.add("hidden");
+    if (loggedInScreen) { loggedInScreen.classList.remove("app-authorized"); loggedInScreen.classList.add("hidden"); }
     if (loginScreen) loginScreen.classList.remove("hidden");
+    loadLoginAssetWall();
+  }
+
+  var loginAssetWallLoading = false;
+  var loginAssetWallLoaded = false;
+  var loginAssetWallResizeHandler = null;
+  var loginAssetWallGridCols = 8;
+  var loginAssetWallGridRows = 5;
+  var loginAssetWallPool = [];
+  var loginAssetWallLastViewportSignature = "";
+
+  function clampNumber(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function getLoginWallGridShape() {
+    /*
+     * Fully geometric / responsive mural math. There are no device presets.
+     * The geometric mean of viewport width and height determines the desired
+     * image scale. We then independently derive columns and rows from the
+     * actual viewport dimensions so phones, tablets, desktops and in-car
+     * displays naturally receive different numbers of assets.
+     *
+     * sqrt(W*H) is the scale signal; dividing by 10.5 makes the wall dense
+     * without turning the assets into unreadably tiny thumbnails. Bounds keep
+     * extreme displays sane.
+     */
+    var width = Math.max(1, Number(window.innerWidth || document.documentElement.clientWidth || 1));
+    var height = Math.max(1, Number(window.innerHeight || document.documentElement.clientHeight || 1));
+    var geometricMean = Math.sqrt(width * height);
+    var targetTileSide = clampNumber(geometricMean / 10.5, 64, 170);
+    var cols = Math.max(1, Math.ceil(width / targetTileSide));
+    var rows = Math.max(1, Math.ceil(height / targetTileSide));
+
+    // Slightly overscan so rounding never leaves an uncovered strip.
+    var overscanCols = cols + 1;
+    var overscanRows = rows + 1;
+    return {
+      width: width,
+      height: height,
+      cols: overscanCols,
+      rows: overscanRows,
+      count: overscanCols * overscanRows,
+      tileSide: targetTileSide
+    };
+  }
+
+  function randomizeArray(list) {
+    var out = Array.isArray(list) ? list.slice() : [];
+    for (var i = out.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+    }
+    return out;
+  }
+
+  function renderLoginAssetWall() {
+    if (!loginAssetWall) return;
+    var shape = getLoginWallGridShape();
+    loginAssetWallGridCols = shape.cols;
+    loginAssetWallGridRows = shape.rows;
+    loginAssetWall.style.setProperty("--login-grid-cols", String(shape.cols));
+    loginAssetWall.style.setProperty("--login-grid-rows", String(shape.rows));
+
+    var pool = randomizeArray(loginAssetWallPool);
+    if (pool.length > shape.count) pool = pool.slice(0, shape.count);
+
+    loginAssetWall.innerHTML = "";
+    var fragment = document.createDocumentFragment();
+    pool.forEach(function (info) {
+      var tile = document.createElement("div");
+      tile.className = "login-asset-tile";
+      var img = document.createElement("img");
+      img.loading = "eager";
+      img.decoding = "async";
+      img.alt = "";
+      img.src = info.url;
+      img.addEventListener("error", function () {
+        tile.remove();
+      }, { once: true });
+      tile.appendChild(img);
+      fragment.appendChild(tile);
+    });
+    loginAssetWall.appendChild(fragment);
+  }
+
+  function collectLoginWallAssetsFromPages(targetCount) {
+    var seen = Object.create(null);
+    loginAssetWallPool.forEach(function (k) { seen[k] = true; });
+
+    function appendPage(marker) {
+      var url = BIRDBUDDY_ASSET_PROXY;
+      if (marker) url += "&marker=" + encodeURIComponent(marker);
+      return fetch(url, {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "Accept": "application/xml,text/xml,*/*" }
+      }).then(function (r) {
+        if (!r.ok) throw new Error("BirdBuddy asset wall HTTP " + r.status);
+        return r.text();
+      }).then(function (xmlText) {
+        var page = parseBirdBuddyAssetXml(xmlText);
+        var keys = Array.isArray(page.keys) ? page.keys : [];
+        keys.forEach(function (key) {
+          var info = assetInfoFromKey(key);
+          if (!info.previewable || seen[info.key]) return;
+          seen[info.key] = true;
+          loginAssetWallPool.push(info);
+        });
+        if (loginAssetWallPool.length >= targetCount) return null;
+        var nextMarker = keys.length ? keys[keys.length - 1] : marker;
+        if (page.isTruncated && nextMarker && nextMarker !== marker) return appendPage(nextMarker);
+        return null;
+      });
+    }
+
+    return appendPage("");
+  }
+
+  function loadLoginAssetWall() {
+    if (!loginAssetWall || loginAssetWallLoading) return;
+    loginAssetWallLoading = true;
+    var initialShape = getLoginWallGridShape();
+    var targetCount = initialShape.count;
+    var viewportSignature = initialShape.width + "x" + initialShape.height + ":" + initialShape.cols + "x" + initialShape.rows;
+
+    try {
+      if (loginAssetWallResizeHandler) window.removeEventListener("resize", loginAssetWallResizeHandler);
+      loginAssetWallResizeHandler = function () {
+        var nextWidth = Math.max(1, Number(window.innerWidth || document.documentElement.clientWidth || 1));
+        var nextHeight = Math.max(1, Number(window.innerHeight || document.documentElement.clientHeight || 1));
+        var nextShape = getLoginWallGridShape();
+        var nextSignature = nextWidth + "x" + nextHeight + ":" + nextShape.cols + "x" + nextShape.rows;
+        if (nextSignature === loginAssetWallLastViewportSignature) return;
+        loginAssetWallLastViewportSignature = nextSignature;
+        var nextTarget = nextShape.count;
+        if (nextTarget > loginAssetWallPool.length) {
+          collectLoginWallAssetsFromPages(nextTarget).then(function () {
+            renderLoginAssetWall();
+          }).catch(function () {
+            renderLoginAssetWall();
+          });
+        } else {
+          renderLoginAssetWall();
+        }
+      };
+      window.addEventListener("resize", loginAssetWallResizeHandler, { passive: true });
+    } catch (_) {}
+
+    loginAssetWallLastViewportSignature = viewportSignature;
+
+    function finish() {
+      loginAssetWallLoaded = true;
+      loginAssetWallLoading = false;
+      renderLoginAssetWall();
+    }
+
+    if (loginAssetWallLoaded && loginAssetWallPool.length >= targetCount) {
+      finish();
+      return;
+    }
+
+    collectLoginWallAssetsFromPages(targetCount)
+      .then(function () { finish(); })
+      .catch(function () {
+        /* The login surface must stay usable even if the asset feed is unavailable. */
+        finish();
+      });
   }
 
   function getInitials(name) {
@@ -4351,10 +5919,106 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     avatarEl.src = pictureUrl.trim();
   }
 
-  function showLoggedIn(profile) {
-    if (!profile) return;
+  function closeUfoDetectPrompt() {
+    ufoPromptOpen = false;
+    if (ufoDetectModalOverlay) ufoDetectModalOverlay.classList.add("hidden");
+  }
+
+  function queryWhoDatButtonByPostcardId(postcardId) {
+    if (!mediaGrid) return null;
+    var wanted = String(postcardId || "").trim();
+    if (!wanted) return null;
+    var buttons = mediaGrid.querySelectorAll('[data-whodat-button="true"]');
+    for (var i = 0; i < buttons.length; i++) {
+      if (String(buttons[i].dataset.postcardId || "") === wanted) return buttons[i];
+    }
+    return null;
+  }
+
+  function getCurrentUnknownBirdos() {
+    /*
+     * First-login detection must come from the authoritative feed data, not from
+     * DOM visibility. The WHO DAT button can be added/filtered during the first
+     * render, which previously created a race where the user could already see
+     * UFOs but the login prompt saw zero.
+     */
+    var out = [];
+    var seen = Object.create(null);
+    var source = Array.isArray(allPostcards) ? allPostcards : [];
+    source.forEach(function (postcard) {
+      if (!postcard || !isWhoDatEligiblePostcard(postcard)) return;
+      var id = String(postcard.id || "").trim();
+      if (!id || seen[id]) return;
+      seen[id] = true;
+      var button = queryWhoDatButtonByPostcardId(id);
+      out.push({ postcard: postcard, button: button, postcardId: id });
+    });
+    return out;
+  }
+
+  function runFirstLoginUfoIdentification() {
+    if (ufoPromptHandled) return;
+    var unknowns = getCurrentUnknownBirdos();
+    ufoPromptHandled = true;
+    closeUfoDetectPrompt();
+    if (!unknowns.length) return;
+    if (unknowns.length === 1) {
+      onIdentifyVisitor(unknowns[0].postcard, unknowns[0].button);
+    } else {
+      runWhoDemBatch();
+    }
+  }
+
+  function maybePromptForUnknownBirdosAfterLogin() {
+    if (!firstLoginUnknownPromptPending || ufoPromptHandled) return;
+    if (feedMode !== "inbox") return;
+    var unknowns = getCurrentUnknownBirdos();
+    if (!unknowns.length) return;
+    firstLoginUnknownPromptPending = false;
+    ufoPromptHandled = false;
+    if (ufoDetectMascot) ufoDetectMascot.src = UFO_MYSTERY_VISITOR_DATA_URI;
+    if (ufoDetectModalMessage) ufoDetectModalMessage.textContent = "UFOs detected. Identify?";
+    ufoPromptOpen = true;
+    if (ufoDetectModalOverlay) ufoDetectModalOverlay.classList.remove("hidden");
+  }
+
+  function hideNoCameraGate() {
+    noCameraGateOpen = false;
+    if (noCameraGate) noCameraGate.classList.add("hidden");
+  }
+
+  function isNoCameraAuthError(error) {
+    if (!error) return false;
+    if (error.isNoCameraError) return true;
+    var msg = String(error.message || "");
+    return /AUTH_SOCIAL_INVALID_USER_ID|invalid user id/i.test(msg);
+  }
+
+  function showNoCameraGate(profile) {
+    noCameraGateOpen = true;
+    activeGoogleProfile = profile || activeGoogleProfile || {};
+    if (loginScreen) loginScreen.classList.add("hidden");
+    if (loggedInScreen) {
+      loggedInScreen.classList.remove("app-authorized");
+      loggedInScreen.classList.add("hidden");
+    }
+    if (noCameraGate) noCameraGate.classList.remove("hidden");
+    if (noCameraGateMascot) noCameraGateMascot.src = UFO_MYSTERY_VISITOR_DATA_URI;
+    if (noCameraGateAvatar) applyAvatarWithFallback(noCameraGateAvatar, activeGoogleProfile.picture || "", activeGoogleProfile.name || "");
+    clearBirdBuddyTokens();
+    firstLoginUnknownPromptPending = false;
+    ufoPromptHandled = true;
+    closeUfoDetectPrompt();
+  }
+
+  function showLoggedIn(profile, options) {
+    options = options || {};
+    if (!profile) return Promise.resolve(false);
+    activeGoogleProfile = profile;
+    hideNoCameraGate();
     loginScreen.classList.add("hidden");
-    loggedInScreen.classList.remove("hidden");
+    loggedInScreen.classList.remove("app-authorized");
+    loggedInScreen.classList.add("hidden");
     applyAvatarWithFallback(avatar, profile.picture || "", profile.name || "");
     mediaGrid.innerHTML = "";
     loadMoreCursor = null;
@@ -4366,15 +6030,29 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     mediaStatus.textContent = "Loading postcards…";
     mediaError.hidden = true;
     mediaEmpty.hidden = true;
+    firstLoginUnknownPromptPending = !!options.promptUnknowns;
+    ufoPromptHandled = false;
     updateFooter();
     feedMode = "inbox";
     communityLevel = "species";
     setFeedSourceActive("inbox");
-    fetchBirdBuddyFeed();
+    return fetchBirdBuddyFeed().then(function (authorized) {
+      if (!authorized || !allCameras.length) return false;
+      loggedInScreen.classList.remove("hidden");
+      loggedInScreen.classList.add("app-authorized");
+      var promptAfterFirstPaint = function () { maybePromptForUnknownBirdosAfterLogin(); };
+      try {
+        window.requestAnimationFrame(function () { window.setTimeout(promptAfterFirstPaint, 0); });
+      } catch (_) {
+        window.setTimeout(promptAfterFirstPaint, 0);
+      }
+      return true;
+    });
   }
 
   function clearFeedGrid(statusText) {
     allPostcards = [];
+    if (mediaStatus) mediaStatus.className = "media-loading";
     if (mediaGrid) mediaGrid.innerHTML = "";
     loadMoreCursor = null;
     hasMore = false;
@@ -4833,13 +6511,17 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return bbGraphql({
       operationName: "authSocialSignIn",
       variables: { socialSignInInput: { token: googleToken, provider: "GOOGLE" } },
-      query: "mutation authSocialSignIn($socialSignInInput: SocialSignInInput!) { authSocialSignIn(socialSignInInput: $socialSignInInput) { ... on Auth { accessToken refreshToken me { user { id __typename } feeders { ... on FeederForOwner { id __typename } __typename } __typename } } } }"
+      query: "mutation authSocialSignIn($socialSignInInput: SocialSignInInput!) { authSocialSignIn(socialSignInInput: $socialSignInInput) { ... on Auth { accessToken refreshToken me { user { id __typename } feeders { __typename ... on FeederForMember { id name __typename } ... on FeederForOwner { id name __typename } ... on FeederForMemberPending { id name __typename } } __typename } } } }"
     }, null).then(function (r) { return r.json(); })
       .then(function (data) {
         var auth = data.data && data.data.authSocialSignIn;
         if (!auth || !auth.accessToken) {
-          var err = (data.errors && data.errors[0] && data.errors[0].message) || "GetBirds sign-in failed";
-          throw new Error(err);
+          var firstError = data.errors && data.errors[0];
+          var err = (firstError && firstError.message) || "GetBirds sign-in failed";
+          var code = firstError && firstError.extensions && firstError.extensions.code;
+          var e = new Error(err);
+          e.isNoCameraError = String(code || "").toUpperCase() === "AUTH_SOCIAL_INVALID_USER_ID" || /AUTH_SOCIAL_INVALID_USER_ID|invalid user id|not associated with.*birdbuddy|no birdbuddy/i.test(String(err || ""));
+          throw e;
         }
         var exp = resolveBbExpiryMs(auth.accessToken);
         localStorage.setItem(STORAGE_KEYS.bbAccessToken, auth.accessToken);
@@ -4957,8 +6639,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
            /Unknown type.*(SightingRecognizedBird|SightingRecognizedBirdUnlocked|SpeciesBird|SpeciesBirdFamily|SpeciesBirdGenus|SpeciesBirdOrder)/i.test(msg);
   }
 
-  function fetchInboxFeed(bbToken, after, useFilter, speciesMode) {
-    var variables = { first: 20 };
+  function fetchInboxFeed(bbToken, after, useFilter, speciesMode, pageSize) {
+    var requestedPageSize = typeof pageSize === "number" && pageSize > 0 ? Math.floor(pageSize) : 20;
+    var variables = { first: requestedPageSize };
     if (after) variables.after = after;
     if (useFilter) variables.filter = { feedItemTypes: ["COLLECTED_POSTCARD", "NEW_POSTCARD"] };
     var query = selectInboxFeedQuery(speciesMode);
@@ -5067,11 +6750,12 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       var name = canonicalizeSpeciesLabel(sp.name || "");
       var sci = (sp.scientificName || "").toString().trim();
       var id = (sp.id || "").toString().trim();
+      var iconUrl = (sp.iconUrl || "").toString().trim();
       if (!name && !sci) return;
       var key = (name || sci).toLowerCase();
       if (seen[key]) return;
       seen[key] = true;
-      out.push({ name: name || "", scientificName: sci, id: id });
+      out.push({ name: name || "", scientificName: sci, id: id, iconUrl: iconUrl, typename: String(sp.__typename || "") });
     }
     if (!node) return out;
     var a = node.mediaSpeciesAssignedName;
@@ -5083,7 +6767,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return out;
   }
 
-  function fetchInboxFeedWithSpeciesFallback(bbToken, after, useFilter) {
+  function fetchInboxFeedWithSpeciesFallback(bbToken, after, useFilter, pageSize) {
     var modes = ["species", "birds", "none"];
     if (speciesQueryMode === "birds") modes = ["birds", "none"];
     if (speciesQueryMode === "none") modes = ["none"];
@@ -5091,7 +6775,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
     function attempt(currentUseFilter) {
       var mode = modes[modeIndex];
-      return fetchInboxFeed(bbToken, after, currentUseFilter, mode).then(function (data) {
+      return fetchInboxFeed(bbToken, after, currentUseFilter, mode, pageSize).then(function (data) {
         speciesQueryMode = mode;
         return data;
       }).catch(function (e) {
@@ -5234,12 +6918,16 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     var isMystery = node.__typename === "CollectionMysteryVisitor";
     var sp = node.species;
     if (Array.isArray(sp)) sp = sp[0];
-    var name = (sp && sp.name) || (node.coverCollectionMedia && Array.isArray(node.coverCollectionMedia.species) && node.coverCollectionMedia.species[0] && node.coverCollectionMedia.species[0].name) || (isMystery ? "Mystery Visitor" : "Unknown");
+    var coverSpecies = node.coverCollectionMedia && Array.isArray(node.coverCollectionMedia.species) ? node.coverCollectionMedia.species[0] : null;
+    var name = (sp && sp.name) || (coverSpecies && coverSpecies.name) || (isMystery ? "Mystery Visitor" : "Unknown");
+    var iconUrl = (sp && sp.iconUrl) || (coverSpecies && coverSpecies.iconUrl) || "";
     var cover = node.coverCollectionMedia && node.coverCollectionMedia.media;
     var img = cover && (cover.thumbnailUrl || cover.contentUrl) || "";
     return {
       id: node.id,
       name: name,
+      scientificName: (sp && sp.scientificName) || (coverSpecies && coverSpecies.scientificName) || "",
+      iconUrl: iconUrl,
       isMystery: isMystery,
       isNew: !!node.markedAsNew,
       visits: (typeof node.visitsAllTime === "number" ? node.visitsAllTime : null),
@@ -5353,11 +7041,11 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     "      __typename id createdAt",
     "      ... on FeedItemNewPostcard {",
     "        reanalyzeAvailability mediaSpeciesNameIdentificationConfidenceLevel",
-    "        mediaSpeciesAssignedName { id name species { id name scientificName } }",
+    "        mediaSpeciesAssignedName { id name species { id name scientificName iconUrl } }",
     "        sightingReportPreview { sightings {",
     "          __typename",
-    "          ... on SightingRecognizedBird { id species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } }",
-    "          ... on SightingRecognizedBirdUnlocked { id species { __typename ... on SpeciesBird { id name scientificName } ... on SpeciesBirdFamily { id name } ... on SpeciesBirdGenus { id name } ... on SpeciesBirdOrder { id name } } }",
+    "          ... on SightingRecognizedBird { id species { __typename ... on SpeciesBird { id name scientificName iconUrl } ... on SpeciesBirdFamily { id name iconUrl } ... on SpeciesBirdGenus { id name iconUrl } ... on SpeciesBirdOrder { id name iconUrl } } }",
+    "          ... on SightingRecognizedBirdUnlocked { id species { __typename ... on SpeciesBird { id name scientificName iconUrl } ... on SpeciesBirdFamily { id name iconUrl } ... on SpeciesBirdGenus { id name iconUrl } ... on SpeciesBirdOrder { id name iconUrl } } }",
     "          ... on SightingRecognizedMysteryVisitor { id }",
     "        } }",
     "      }",
@@ -5417,6 +7105,17 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return getCanonicalSpeciesList(postcard).some(function (name) {
       return !isUnknownSpeciesLabel(name);
     });
+  }
+
+  // Single source of truth for whether a postcard is a real WHO DAT?!? target.
+  // The Unknown Birdo filter, per-card WHO DAT button, and WHO DEM?!? queue must
+  // all use this exact predicate so their counts can never disagree.
+  function isWhoDatEligiblePostcard(postcard) {
+    return !!(postcard &&
+      feedMode === "inbox" &&
+      postcard.itemType === "FeedItemNewPostcard" &&
+      !postcard.isLiveCapture &&
+      !postcardHasKnownSpecies(postcard));
   }
 
   function isPostcardCollected(postcard) {
@@ -5651,13 +7350,13 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       card.setAttribute("data-collection-id", c.id);
       var imgWrap = document.createElement("div");
       imgWrap.className = "species-collection-img";
-      if (c.cover) { var im = document.createElement("img"); im.src = c.cover; im.alt = c.name; im.loading = "lazy"; imgWrap.appendChild(im); }
+      if (c.cover) { var im = document.createElement("img"); im.src = getBirdBuddyMediaProxyUrl(c.cover); im.alt = c.name; im.loading = "lazy"; imgWrap.appendChild(im); }
       if (c.isNew) { var badge = document.createElement("span"); badge.className = "species-collection-new"; badge.textContent = "NEW"; imgWrap.appendChild(badge); }
       card.appendChild(imgWrap);
-      var title = document.createElement("div");
-      title.className = "species-collection-name";
-      title.textContent = c.name;
-      card.appendChild(title);
+      var head = document.createElement("div");
+      head.className = "species-collection-head";
+      appendSpeciesIdentity(head, { name: c.name, scientificName: c.scientificName, iconUrl: c.iconUrl }, true);
+      card.appendChild(head);
       var metaRow = document.createElement("div");
       metaRow.className = "species-collection-meta";
       var da = formatDaysAgo(c.lastVisit);
@@ -5790,36 +7489,43 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     var wrap = document.createElement("div");
     wrap.className = postcard.isLiveCapture ? "postcard-group live-capture-group" : "postcard-group";
     wrap.setAttribute("data-postcard-id", postcard.id || "");
+    wrap.setAttribute("data-created-at", postcard.createdAt || "");
     wrap.setAttribute("data-camera-id", postcard.feederId || "");
     wrap.setAttribute("data-collected", collectedState ? "1" : "0");
     var speciesStr = formatSpeciesLabel(postcard);
     wrap.setAttribute("data-species", speciesStr);
-    var label = document.createElement("div");
-    label.className = "postcard-group-label";
-    label.textContent = postcard.isLiveCapture ? ("🔴 LIVE — " + speciesStr) : speciesStr;
-    var badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = mediaSummary(postcard.medias);
-    label.appendChild(document.createTextNode(" "));
-    label.appendChild(badge);
-    wrap.appendChild(label);
-    var grid = document.createElement("div");
-    grid.className = "postcard-group-media";
-    postcard.medias.forEach(function (m, mediaIndex) {
-      grid.appendChild(buildMediaCard(postcard, m, mediaIndex));
-    });
-    wrap.appendChild(grid);
 
-    var footer = document.createElement("div");
-    footer.className = "postcard-group-footer";
+    // One compact purple rail: species identity plus every postcard metadata field.
+    var speciesStrip = document.createElement("div");
+    speciesStrip.className = "postcard-species-strip";
+
+    var speciesListWrap = document.createElement("div");
+    speciesListWrap.className = "postcard-species-list";
+    var speciesDetails = getSpeciesDetails(postcard);
+    if (speciesDetails.length) {
+      speciesDetails.forEach(function (detail) {
+        var pill = document.createElement("div");
+        pill.className = "postcard-species-pill";
+        appendSpeciesIdentity(pill, detail, false);
+        speciesListWrap.appendChild(pill);
+      });
+    } else {
+      var empty = document.createElement("span");
+      empty.className = "postcard-species-empty";
+      empty.textContent = UNKNOWN_SPECIES_LABEL;
+      speciesListWrap.appendChild(empty);
+    }
+    speciesStrip.appendChild(speciesListWrap);
+
     var meta = document.createElement("div");
-    meta.className = "postcard-group-meta";
-    function metaRow(label, value) {
+    meta.className = "postcard-meta-rail";
+
+    function metaRow(label, value, extraClass) {
       var row = document.createElement("div");
-      row.className = "meta-row";
+      row.className = "meta-row" + (extraClass ? " " + extraClass : "");
       var lab = document.createElement("span");
       lab.className = "meta-label";
-      lab.textContent = label + ": ";
+      lab.textContent = label + ":";
       var val = document.createElement("span");
       val.className = "meta-value";
       val.textContent = value != null && value !== "" ? value : "—";
@@ -5827,52 +7533,60 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       row.appendChild(val);
       return row;
     }
-    function metaCheckboxRow(label, checked, indicatorKey) {
+
+    function metaCheckboxRow(label, checked) {
       var row = document.createElement("div");
       row.className = "meta-row meta-row-checkbox";
       var lab = document.createElement("span");
       lab.className = "meta-label";
-      lab.textContent = label + ": ";
+      lab.textContent = label + ":";
       var val = document.createElement("span");
       val.className = "meta-value";
       var checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.disabled = true;
       checkbox.checked = !!checked;
+      checkbox.setAttribute("data-collected-indicator", "true");
       checkbox.setAttribute("aria-label", label);
-      if (indicatorKey) checkbox.setAttribute(indicatorKey, "true");
       val.appendChild(checkbox);
       row.appendChild(lab);
       row.appendChild(val);
       return row;
     }
-    meta.appendChild(metaRow("ID", postcard.id));
-    if (postcard.feeder && postcard.feeder.name) {
-      meta.appendChild(metaRow("Camera", postcard.feeder.name));
-    }
-    if (postcard.feeder && (postcard.feeder.city || postcard.feeder.country)) {
-      meta.appendChild(metaRow("Location", formatCameraLocation(postcard.feeder)));
-    }
-    var speciesRow = metaRow("Species", formatSpeciesLabel(postcard));
-    var speciesRowVal = speciesRow.querySelector(".meta-value");
-    if (speciesRowVal) speciesRowVal.classList.add("species-meta-value");
-    meta.appendChild(speciesRow);
-    meta.appendChild(metaCheckboxRow("Collected", collectedState, "data-collected-indicator"));
+
+    meta.appendChild(metaRow("ID", postcard.id, "meta-row-id"));
+    if (postcard.feeder && postcard.feeder.name) meta.appendChild(metaRow("Camera", postcard.feeder.name));
+    if (postcard.feeder && (postcard.feeder.city || postcard.feeder.country)) meta.appendChild(metaRow("Location", formatCameraLocation(postcard.feeder)));
+    meta.appendChild(metaCheckboxRow("Collected", collectedState));
     meta.appendChild(metaRow("Created", formatPostcardDate(postcard.createdAt)));
     if (!postcard.isLiveCapture) meta.appendChild(metaRow("Expires", formatPostcardDate(postcard.expiresAt)));
     var mediaCountRow = metaRow("Media", postcard.medias.length + " item" + (postcard.medias.length === 1 ? "" : "s"));
     var mediaCountVal = mediaCountRow.querySelector(".meta-value");
-    if (mediaCountVal) mediaCountVal.classList.add("media-count-meta-value");
+    if (mediaCountVal) mediaCountVal.classList.add("media-count-meta-value", "meta-count");
     meta.appendChild(mediaCountRow);
-    footer.appendChild(meta);
+    speciesStrip.appendChild(meta);
+    wrap.appendChild(speciesStrip);
+
+    var grid = document.createElement("div");
+    grid.className = "postcard-group-media";
+    postcard.medias.forEach(function (m, mediaIndex) {
+      grid.appendChild(buildMediaCard(postcard, m, mediaIndex));
+    });
+    wrap.appendChild(grid);
+
+    // Footer is action-only; descriptive metadata now lives in the top purple rail.
+    var footer = document.createElement("div");
+    footer.className = "postcard-group-footer";
     var actions = document.createElement("div");
     actions.className = "postcard-group-actions";
+
     var downloadPostcardBtn = document.createElement("button");
     downloadPostcardBtn.type = "button";
     downloadPostcardBtn.className = "btn";
     downloadPostcardBtn.textContent = "Download Postcard";
     downloadPostcardBtn.dataset.postcardId = postcard.id || "";
     downloadPostcardBtn.addEventListener("click", function () { onDownloadPostcard(postcard, downloadPostcardBtn); });
+
     var saveCollectionBtn = document.createElement("button");
     saveCollectionBtn.type = "button";
     saveCollectionBtn.className = "btn btn-primary";
@@ -5883,18 +7597,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     saveCollectionBtn.disabled = collectedState;
     saveCollectionBtn.addEventListener("click", function () { onSaveToCollection(postcard, saveCollectionBtn); });
 
-    // WHO DAT?!? — Identify Visitor. Offered when the bird is a Mystery Visitor /
-    // unidentified; re-runs BirdBuddy inference to name it, like the native app.
     var whoDatBtn = null;
-    // Identify (reanalyze) only applies to NEW inbox postcards with an
-    // unidentified bird — the exact case the native app offers "identify" for.
-    // Collected/expired items or saved media aren't reanalyzable (BirdBuddy
-    // returns an internal error), so don't offer WHO DAT there. Live-capture
-    // postcards never got a real BirdBuddy feed item at all (they're a local
-    // canvas screenshot of the raw stream, never ingested by BirdBuddy's own
-    // pipeline) — confirmed in practice that reanalyze always comes back
-    // "couldn't identify", so don't offer it there either.
-    if (feedMode === "inbox" && postcard.itemType === "FeedItemNewPostcard" && !postcard.isLiveCapture && !postcardHasKnownSpecies(postcard)) {
+    if (isWhoDatEligiblePostcard(postcard)) {
       whoDatBtn = document.createElement("button");
       whoDatBtn.type = "button";
       whoDatBtn.className = "btn btn-whodat";
@@ -5906,14 +7610,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     }
 
     actions.appendChild(downloadPostcardBtn);
-    // My-media view items are already saved — no Save to collection there.
-    // Live captures have no real BirdBuddy feed item to collect either — same
-    // root cause as WHO DAT above.
     if (feedMode === "inbox" && !postcard.isLiveCapture) actions.appendChild(saveCollectionBtn);
     if (whoDatBtn) actions.appendChild(whoDatBtn);
-    // Live captures are screenshots only (no recorded video) — Save to
-    // YouTube has nothing to do there, so skip it entirely rather than show
-    // it permanently disabled.
+
     if (!postcard.isLiveCapture) {
       var saveYoutubeBtn = document.createElement("button");
       var hasVideoMedia = postcardHasVideoMedia(postcard);
@@ -5934,6 +7633,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       saveYoutubeBtn.addEventListener("click", function () { onSaveToYouTube(postcard, saveYoutubeBtn); });
       actions.appendChild(saveYoutubeBtn);
     }
+
     footer.appendChild(actions);
     wrap.appendChild(footer);
     return wrap;
@@ -5942,13 +7642,19 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   function appendPostcardGroups(postcards) {
     if (feedMode === "community" && communityLevel === "postcards") ensureCommunityBackBar();
     postcards.forEach(function (postcard) {
+      var naturalIndex = allPostcards.length;
       allPostcards.push(postcard);
-      mediaGrid.appendChild(buildPostcardGroupElement(postcard));
+      var group = buildPostcardGroupElement(postcard);
+      group.setAttribute("data-natural-order", String(naturalIndex));
+      group.setAttribute("data-created-at", postcard.createdAt || "");
+      mediaGrid.appendChild(group);
     });
+    applyPostcardSort();
   }
 
-  function fetchBirdBuddyFeed() {
+  function fetchBirdBuddyFeed(keepPullStatus, pageSizeOverride) {
     var googleToken = localStorage.getItem(STORAGE_KEYS.googleAccessToken);
+    var requestedPageSize = (typeof pageSizeOverride === "number" && pageSizeOverride > 0) ? Math.floor(pageSizeOverride) : null;
 
     var isCommunitySpecies = feedMode === "community" && communityLevel === "species";
 
@@ -5958,6 +7664,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         var collections = collectSpeciesCollections(data);
         hasMore = false; loadMoreCursor = null;
         renderSpeciesCollections(collections);
+        if (postcardSortSelect) { postcardSortSelect.hidden = true; if (postcardSortSelect.parentElement) postcardSortSelect.parentElement.hidden = true; }
         mediaStatus.hidden = true;
         if (collections.length === 0) { mediaEmpty.hidden = false; mediaEmpty.textContent = "You haven’t collected any species yet."; }
         updateFooter();
@@ -5979,7 +7686,12 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       loadMoreCursor = pageInfo && pageInfo.endCursor ? pageInfo.endCursor : null;
 
       appendPostcardGroups(postcards);
-      mediaStatus.hidden = true;
+      if (keepPullStatus) {
+        var loadedNow = getDisplayedCounts().postcards;
+        showCameraPullStatus(loadedNow + " postcards loaded" + (hasMore ? " — fetching the next page..." : ""));
+      } else {
+        mediaStatus.hidden = true;
+      }
       if (postcards.length === 0 && !loadMoreCursor) {
         mediaEmpty.hidden = false;
       }
@@ -5993,9 +7705,14 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     function doFetch(token) {
       return fetchMe(token).then(function (meData) {
         applyCameraInventoryFromMeData(meData);
+        if (!allCameras.length) {
+          var noCameraError = new Error("No BirdBuddy camera is associated with this Google account.");
+          noCameraError.isNoCameraError = true;
+          throw noCameraError;
+        }
         if (isCommunitySpecies) return fetchMeCollections(token);
         if (feedMode === "community") return fetchCollectionMedia(token, communityCollectionId, loadMoreCursor);
-        return fetchInboxFeedWithSpeciesFallback(token, loadMoreCursor, true);
+        return fetchInboxFeedWithSpeciesFallback(token, loadMoreCursor, true, requestedPageSize || undefined);
       }).then(function (data) {
         applyFeedResponse(data);
       });
@@ -6028,16 +7745,69 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       return Promise.reject(e);
     }).then(function () {
       mediaError.hidden = true;
+      return true;
     }).catch(function (e) {
+      if (isNoCameraAuthError(e)) {
+        mediaStatus.hidden = true;
+        if (mediaError) mediaError.hidden = true;
+        showNoCameraGate(activeGoogleProfile);
+        return false;
+      }
       mediaStatus.hidden = true;
       mediaError.hidden = false;
       mediaError.textContent = e.message || "Failed to load feed";
       if (e && (e.isCorsError || e.isNetworkError || (e.message && /CORS|Failed to fetch|ERR_FAILED|network/i.test(e.message)))) {
         mediaError.textContent += " Check that Apache/PHP is running and the PHP cURL extension is enabled.";
       }
+      return false;
     }).finally(function () {
-      if (isInitialLoad) setBusy(false);
+      if (isInitialLoad && !keepPullStatus) setBusy(false);
       loadMoreBtn.disabled = false;
+    });
+  }
+
+  function pullAllCameraPostcards() {
+    if (busy || fullCameraPullActive) return;
+    feedMode = "inbox";
+    communityLevel = "species";
+    communityCollectionId = "";
+    communityCollectionName = "";
+    postcardSortMode = "";
+    birdsOnlyFilter = false;
+    clearFeedGrid("Pulling all postcards from your camera...");
+    setFeedSourceActive("inbox");
+    fullCameraPullActive = true;
+    setBusy(true);
+    showCameraPullStatus("Starting the complete non-expired postcard pull...");
+    setHeaderStatus("Postcards on your camera — pulling the complete feed...", false, { persist: true });
+
+    function nextPage() {
+      if (!fullCameraPullActive) return;
+      if (!hasMore) {
+        var counts = getDisplayedCounts();
+        finishCameraPullStatus("Camera pull complete — " + counts.postcards + " postcards loaded.", false);
+        return;
+      }
+      showCameraPullStatus(getDisplayedCounts().postcards + " postcards loaded — fetching the next page...");
+      fetchBirdBuddyFeed(true, 100).then(function () {
+        if (!fullCameraPullActive) return;
+        if (mediaError && !mediaError.hidden) {
+          finishCameraPullStatus("Camera pull stopped because BirdBuddy returned an error.", true);
+          return;
+        }
+        nextPage();
+      });
+    }
+
+    // The first page is fetched at 100 rather than the normal 20; continue through
+    // pageInfo until BirdBuddy says there are no more non-expired feed items.
+    fetchBirdBuddyFeed(true, 100).then(function () {
+      if (!fullCameraPullActive) return;
+      if (mediaError && !mediaError.hidden) {
+        finishCameraPullStatus("Camera pull stopped because BirdBuddy returned an error.", true);
+        return;
+      }
+      nextPage();
     });
   }
 
@@ -6176,35 +7946,151 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       });
   }
 
-  // Identify Visitor ("WHO DAT?!?"): re-run BirdBuddy inference on the postcard and
-  // reflect any newly identified species in the feed — same as the native app.
+  // Identify Visitor ("WHO DAT?!?"): re-run BirdBuddy inference on one postcard.
+  // The mutation is the trigger; BirdBuddy's feed becomes the source of truth for
+  // completion. WHO DEM?!? uses this same single-target function, but waits for the
+  // post-mutation feed state before it is allowed to advance to another postcard.
   function extractSpeciesFromReanalyze(data) {
     var root = data && data.data && data.data.inferenceExternalPostcardReanalyze;
     var updated = root && root.updatedFeedItem;
     if (!updated) return null;
     var names = extractSpeciesNames(updated);
     var known = names.filter(function (n) { return !isUnknownSpeciesLabel(n); });
-    return { names: names, known: known };
+    return { names: names, known: known, detailed: extractSpeciesDetailed(updated), updatedFeedItem: updated };
+  }
+
+  function getPostcardKnownSpecies(postcard) {
+    if (!postcard) return [];
+    return getCanonicalSpeciesList(postcard).filter(function (name) {
+      return !isUnknownSpeciesLabel(name);
+    });
+  }
+
+  function findPostcardInFreshFeedData(data, postcardId) {
+    var fresh = collectPostcardsFromFeed(data);
+    for (var i = 0; i < fresh.length; i++) {
+      if (fresh[i] && String(fresh[i].id || "") === String(postcardId || "")) return fresh[i];
+    }
+    return null;
+  }
+
+  function pollWhoDatFeedForResult(feedItemId, bbToken, seedData) {
+    var immediate = seedData && extractSpeciesFromReanalyze(seedData);
+    if (immediate && immediate.known.length) {
+      return Promise.resolve({ identified: true, postcard: null, data: seedData, species: immediate.known, speciesDetailed: immediate.detailed || [] });
+    }
+
+    // Give BirdBuddy a chance to finish its server-side inference. Each poll is a
+    // READ against the current feed; we never call the reanalyze mutation again.
+    // Bounded read-only polling: fast at first, then backing off slightly so a
+    // slow inference does not turn one postcard into a high-frequency API loop.
+    // Eight feed reads, including the immediate read, give BirdBuddy about 9 seconds.
+    var delays = [0, 750, 1000, 1250, 1500, 1750, 2000, 2500];
+    var attempt = 0;
+
+    function poll() {
+      return fetchInboxFeedWithSpeciesFallback(bbToken, null, true, 100)
+        .then(function (data) {
+          var found = findPostcardInFreshFeedData(data, feedItemId);
+          if (found) {
+            var known = getPostcardKnownSpecies(found);
+            if (known.length) {
+              return { identified: true, postcard: found, data: data, species: known, speciesDetailed: found.speciesDetailed || [] };
+            }
+          }
+
+          attempt += 1;
+          if (attempt >= delays.length) {
+            return { identified: false, postcard: found, data: data, species: [] };
+          }
+          return waitMs(delays[attempt]).then(poll);
+        });
+    }
+
+    return waitMs(delays[0]).then(poll);
   }
 
   // Single-click entry point (respects the global busy flag as its reentrancy
-  // guard). WHO DEM?!? batches call identifyVisitor() directly below, since
-  // the batch itself owns the busy flag for its whole run.
+  // guard). WHO DEM?!? owns busy for the whole batch and calls identifyVisitor
+  // directly so the single-flight guard does not block the next queued target.
   function onIdentifyVisitor(postcard, button) {
     if (!postcard || !postcard.id || busy) return;
-    return identifyVisitor(postcard, button);
+    return identifyVisitor(postcard, button, { batch: false })
+      .then(function (result) {
+        updateFooter();
+        return result;
+      });
   }
 
-  function identifyVisitor(postcard, button) {
-    if (!postcard || !postcard.id) return Promise.resolve();
+  function identifyVisitor(postcard, button, options) {
+    options = options || {};
+    if (!postcard || !postcard.id) return Promise.resolve({ identified: false, postcard: postcard });
     var feedItemId = String(postcard.id);
     var original = button ? button.textContent : "";
-    if (button) { button.disabled = true; button.textContent = "Identifying…"; button.classList.add("uploading"); }
-    setHeaderStatus("WHO DAT?!? Asking BirdBuddy to identify the visitor…", false, { persist: true });
+    var isBatch = !!options.batch;
 
-    function finish(msg, isErr) {
-      if (button) { button.disabled = false; button.textContent = original || "WHO DAT?!?"; button.classList.remove("uploading"); }
-      setHeaderStatus(msg, !!isErr);
+    if (button) {
+      if (!isBatch) button.removeAttribute("data-whodat-batch-processed");
+      button.disabled = true;
+      button.textContent = "Identifying…";
+      button.classList.add("uploading");
+      if (isBatch) button.setAttribute("data-whodat-batch-processing", "1");
+    }
+    if (isBatch && typeof options.onBatchStatus === "function") {
+      options.onBatchStatus("asking");
+    } else {
+      setHeaderStatus(
+        isBatch ? "WHO DEM?!? Asking BirdBuddy to identify visitor " + feedItemId.slice(0, 8) + "…" : "WHO DAT?!? Asking BirdBuddy to identify the visitor…",
+        false,
+        { persist: true }
+      );
+    }
+
+    function finishButton() {
+      if (!button) return;
+      button.disabled = false;
+      button.textContent = original || "WHO DAT?!?";
+      button.classList.remove("uploading");
+      button.removeAttribute("data-whodat-batch-processing");
+    }
+
+    function markBatchProcessed() {
+      if (button && isBatch) button.setAttribute("data-whodat-batch-processed", "1");
+    }
+
+    function patchIdentifiedPostcard(updatedPostcard, knownSpecies, detailedSpecies) {
+      var effectiveSpecies = Array.isArray(knownSpecies) ? knownSpecies : [];
+      if (updatedPostcard && effectiveSpecies.length) {
+        postcard.species = effectiveSpecies.slice();
+        postcard.speciesDetailed = updatedPostcard.speciesDetailed || detailedSpecies || postcard.speciesDetailed || [];
+      } else if (effectiveSpecies.length) {
+        postcard.species = effectiveSpecies.slice();
+        postcard.speciesDetailed = Array.isArray(detailedSpecies) && detailedSpecies.length ? detailedSpecies : (postcard.speciesDetailed || []);
+      }
+
+      if (!effectiveSpecies.length) return;
+      var joined = effectiveSpecies.join(", ");
+      try {
+        var group = null;
+        var groups = mediaGrid ? mediaGrid.querySelectorAll('.postcard-group') : [];
+        for (var gi = 0; gi < groups.length; gi++) {
+          if ((groups[gi].getAttribute("data-postcard-id") || "") === feedItemId) { group = groups[gi]; break; }
+        }
+        if (group) {
+          group.setAttribute("data-species", joined);
+          var sv = group.querySelector(".species-meta-value");
+          if (sv) { sv.innerHTML = ""; var mini = document.createElement("div"); mini.className = "postcard-species-list"; getSpeciesDetails(postcard).forEach(function (detail) { var pill = document.createElement("div"); pill.className = "postcard-species-pill"; appendSpeciesIdentity(pill, detail, false); mini.appendChild(pill); }); sv.appendChild(mini); }
+          var strip = group.querySelector(".postcard-species-list");
+          if (strip && strip !== sv) { strip.innerHTML = ""; getSpeciesDetails(postcard).forEach(function (detail) { var pill = document.createElement("div"); pill.className = "postcard-species-pill"; appendSpeciesIdentity(pill, detail, false); strip.appendChild(pill); }); }
+          var wb = group.querySelector('[data-whodat-button="true"]');
+          if (wb) {
+            wb.removeAttribute("data-whodat-batch-processed");
+            wb.removeAttribute("data-whodat-batch-processing");
+            if (wb.parentNode) wb.parentNode.removeChild(wb);
+          }
+        }
+      } catch (_) {}
+      applySpeciesFilter();
     }
 
     function runReanalyze(bbToken) {
@@ -6231,48 +8117,69 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         if (e && e.isAuthError) { clearBirdBuddyTokens(); return getValidBbToken().then(runReanalyze); }
         throw e;
       })
-      .then(function (data) {
-        var res = extractSpeciesFromReanalyze(data);
-        if (res && res.known.length) {
-          postcard.species = res.known;
-          var joined = res.known.join(", ");
-          // Patch the rendered card in place: label, filter attribute, drop button.
-          try {
-            var group = null;
-            var groups = mediaGrid ? mediaGrid.querySelectorAll('.postcard-group') : [];
-            for (var gi = 0; gi < groups.length; gi++) {
-              if ((groups[gi].getAttribute("data-postcard-id") || "") === feedItemId) { group = groups[gi]; break; }
-            }
-            if (group) {
-              group.setAttribute("data-species", joined);
-              // The visible card title (top-left label) is the primary place the
-              // species name shows — it was never being patched, so a successful
-              // identify silently left "Unknown Birdo" showing until a reload.
-              var titleLabel = group.querySelector(".postcard-group-label");
-              if (titleLabel && titleLabel.firstChild && titleLabel.firstChild.nodeType === 3) {
-                titleLabel.firstChild.nodeValue = joined;
+      .then(function (mutationData) {
+        return getValidBbToken().then(function (bbToken) {
+          if (isBatch && typeof options.onBatchStatus === "function") {
+            options.onBatchStatus("waiting");
+          }
+          return pollWhoDatFeedForResult(feedItemId, bbToken, mutationData)
+            .then(function (result) {
+              if (result.identified) {
+                patchIdentifiedPostcard(result.postcard, result.species, result.speciesDetailed);
+                markBatchProcessed();
+                finishButton();
+                if (!isBatch) {
+                  setHeaderStatus("WHO DAT?!? It’s " + result.species.join(", ") + "!", false);
+                  var targetGroup = mediaGrid ? mediaGrid.querySelector('.postcard-group[data-postcard-id="' + String(feedItemId).replace(/"/g, '\\"') + '"]') : null;
+                  if (targetGroup) {
+                    var oldResult = targetGroup.querySelector(".who-dat-result"); if (oldResult) oldResult.remove();
+                    var resultBox = document.createElement("div"); resultBox.className = "who-dat-result";
+                    var primaryDetail = getSpeciesDetails(postcard)[0] || { name: result.species[0] || UNKNOWN_SPECIES_LABEL };
+                    appendSpeciesIdentity(resultBox, primaryDetail, true);
+                    var copy = document.createElement("div"); copy.className = "who-dat-copy";
+                    var kicker = document.createElement("div"); kicker.className = "who-dat-kicker"; kicker.textContent = "WHO DAT RESULT"; copy.appendChild(kicker);
+                    var resolvedName = document.createElement("div"); resolvedName.className = "species-identity-name"; resolvedName.textContent = result.species.join(", "); copy.appendChild(resolvedName);
+                    resultBox.appendChild(copy); targetGroup.appendChild(resultBox);
+                  }
+                }
+                return {
+                  identified: true,
+                  species: result.species,
+                  postcard: result.postcard || postcard
+                };
               }
-              var sv = group.querySelector(".species-meta-value");
-              if (sv) sv.textContent = joined;
-              var wb = group.querySelector('[data-whodat-button="true"]');
-              if (wb) wb.parentNode && wb.parentNode.removeChild(wb);
-            }
-          } catch (_) {}
-          applySpeciesFilter(); // refresh species-filter chips/visibility
-          finish("WHO DAT?!? It’s " + joined + "!", false);
-        } else {
-          finish("Still a mystery visitor — BirdBuddy couldn’t identify it. Try again later.", false);
-        }
+
+              // IMPORTANT: a completed-but-unidentified response is still a completed
+              // batch item. Mark it processed so WHO DEM never re-queues the same
+              // button forever. Leave the individual WHO DAT button available for a
+              // later manual retry, but it no longer belongs to THIS batch.
+              markBatchProcessed();
+              finishButton();
+              if (!isBatch) {
+                setHeaderStatus("Still a mystery visitor — BirdBuddy couldn’t identify it. Try again later.", false);
+              }
+              return {
+                identified: false,
+                species: [],
+                postcard: result.postcard || postcard
+              };
+            });
+        });
       })
       .catch(function (e) {
         var raw = (e && e.message) ? String(e.message) : "";
-        // BirdBuddy returns a generic internal/unavailable error when a postcard
-        // can't be reanalyzed (already identified, too old, or not eligible).
-        if (!raw || /internal|unavailable|not available|reanalyz|INFERENCE/i.test(raw)) {
-          finish("BirdBuddy couldn’t re-identify this visitor right now (it may already be identified or too old).", false);
-        } else {
-          finish(raw, true);
+        markBatchProcessed();
+        finishButton();
+        if (!isBatch) {
+          if (!raw || /internal|unavailable|not available|reanalyz|INFERENCE/i.test(raw)) {
+            setHeaderStatus("BirdBuddy couldn’t re-identify this visitor right now (it may already be identified or too old).", false);
+          } else {
+            setHeaderStatus(raw, true);
+          }
         }
+        // Batch semantics: one response/error settles exactly ONE queued target.
+        // Do not reject the whole batch; the queue must advance to the next postcard.
+        return { identified: false, error: raw || "Identify failed.", postcard: postcard };
       });
   }
 
@@ -6283,50 +8190,108 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return null;
   }
 
-  // WHO DEM?!? — batch-run WHO DAT?!? top to bottom over every currently
-  // unidentified postcard. Staggered (one at a time, each awaited before the
-  // next fires) rather than parallel, matching the "identifying, please
-  // wait" single-flight feel the per-postcard button already has. It's a
-  // coin flip whether any given one actually gets identified — that's normal,
-  // not an error, so a postcard staying "Unknown Birdo" isn't treated as a
-  // failure.
+  // WHO DEM?!? — take a SNAPSHOT of the currently visible WHO DAT buttons and
+  // process that snapshot exactly once, in DOM order. Never re-query the DOM to
+  // choose the next target: an unresolved WHO DAT button may remain visible for
+  // manual retry, but it must never be accidentally re-added to this batch.
   function runWhoDemBatch() {
     if (busy || !whoDemBtn) return;
-    var buttons = mediaGrid ? mediaGrid.querySelectorAll('[data-whodat-button="true"]') : [];
-    var total = buttons.length;
-    if (total === 0) return;
+
+    // Snapshot exactly the WHO DAT targets that are visible RIGHT NOW. The queue is
+    // deliberately frozen so DOM changes during inference cannot add/re-add targets.
+    var queued = [];
+    var seenIds = Object.create(null);
+    getVisibleWhoDatButtons().forEach(function (btn) {
+      var postcardId = String(btn.dataset.postcardId || "").trim();
+      if (!postcardId || seenIds[postcardId]) return;
+      var postcard = findPostcardById(postcardId);
+      if (!postcard) return;
+      seenIds[postcardId] = true;
+      queued.push({ postcard: postcard, button: btn, postcardId: postcardId });
+    });
+
+    var total = queued.length;
+    if (total === 0) {
+      setHeaderStatus("WHO DEM?!? No eligible WHO DAT?!? mystery visitors are currently visible.", false);
+      updateFooter();
+      return;
+    }
 
     setBusy(true);
     whoDemBtn.hidden = true;
     loadMoreBtn.hidden = true;
     loadAllBtn.hidden = true;
     mediaError.hidden = true;
-    mediaStatus.hidden = false;
+    // Active action status is always shown in the sticky header. The footer remains
+    // the durable page statistic, but it is never the only progress indicator.
+    mediaStatus.hidden = true;
 
-    var done = 0;
-    function next() {
-      // Re-query each pass: a successful identify removes its own button from
-      // the DOM, and the set can shift as the grid updates.
-      var remaining = mediaGrid.querySelectorAll('[data-whodat-button="true"]');
-      if (!remaining.length) {
-        mediaStatus.hidden = true;
-        setBusy(false);
-        updateFooter();
-        setHeaderStatus("WHO DEM?!? Checked " + total + " mystery visitor" + (total === 1 ? "" : "s") + ".", false);
-        return;
+    var index = 0;
+    var identifiedCount = 0;
+    var unresolvedCount = 0;
+
+    function setBatchStatus(phase) {
+      var visibleWhoDatCount = getVisibleWhoDatButtons().length;
+      var remainingQueue = Math.max(0, queued.length - index);
+      var state;
+      if (phase === "waiting") {
+        state = "Waiting for BirdBuddy response";
+      } else if (phase === "complete") {
+        state = "Completed mystery visitor " + index + " of " + total + ".";
+      } else {
+        state = "Identifying mystery visitor " + index + " of " + total + "…";
       }
-      done += 1;
-      mediaStatus.textContent = "WHO DEM?!? Identifying mystery visitor " + done + " of " + total + "…";
-      var btn = remaining[0];
-      var postcard = findPostcardById(btn.dataset.postcardId || "");
-      if (!postcard) {
-        // No matching postcard (shouldn't happen) — drop the stale button and move on.
-        btn.removeAttribute("data-whodat-button");
-        next();
-        return;
-      }
-      identifyVisitor(postcard, btn).then(next);
+      var msg = "WHO DEM?!? " + state +
+        " " + visibleWhoDatCount + " WHO DAT?!? button" + (visibleWhoDatCount === 1 ? "" : "s") +
+        " visible; " + remainingQueue + " queued.";
+      setHeaderStatus(msg, false, { persist: true });
     }
+
+    function finishBatch() {
+      mediaStatus.hidden = true;
+      setBusy(false);
+      updateFooter();
+      var finalVisibleWhoDatCount = getVisibleWhoDatButtons().length;
+      var checked = identifiedCount + unresolvedCount;
+      var summary =
+        "WHO DEM?!? Checked " + checked + " mystery visitor" + (checked === 1 ? "" : "s") +
+        ". Identified " + identifiedCount +
+        "; " + unresolvedCount + " still " + UNKNOWN_SPECIES_LABEL +
+        ". " + finalVisibleWhoDatCount + " WHO DAT?!? button" +
+        (finalVisibleWhoDatCount === 1 ? "" : "s") + " remain visible.";
+      setHeaderStatus(summary, false, { persist: false });
+    }
+
+    function next() {
+      if (index >= queued.length) {
+        finishBatch();
+        return;
+      }
+
+      var item = queued[index];
+      index += 1;
+      setBatchStatus("running");
+
+      // ONE postcard at a time. identifyVisitor does the mutation, waits for the
+      // BirdBuddy feed polling to settle, updates this card, then resolves. Only that
+      // resolution permits this function to advance to the next snapshot target.
+      identifyVisitor(item.postcard, item.button, {
+        batch: true,
+        onBatchStatus: function (phase) {
+          setBatchStatus(phase === "waiting" ? "waiting" : "running");
+        }
+      }).then(function (result) {
+        if (result && result.identified) identifiedCount += 1;
+        else unresolvedCount += 1;
+        setBatchStatus("complete");
+        next();
+      }).catch(function () {
+        unresolvedCount += 1;
+        setBatchStatus("complete");
+        next();
+      });
+    }
+
     next();
   }
 
@@ -6761,6 +8726,110 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     return sendToFrameio(postcard, media);
   }
 
+  // Universal Adobe gate for ANY Frame.io push path. The caller must invoke this
+  // before a local/blob push because that payload cannot survive a page redirect.
+  // The gate reuses the provided browser window so the user gets one consistent
+  // Adobe sign-in experience everywhere.
+  function ensureFrameioAdobeGate(postcard, media, existingWin) {
+    // Security cache policy: after a REAL successful Frame.io push, reuse the
+    // verified server session for later pushes. Never trust the browser flag
+    // by itself: confirm that the live server still reports a ready session.
+    // If the server session has expired, been revoked, or never completed a
+    // successful push, fall through to the Adobe IMS gate.
+    function cachedSessionReady() {
+      if (!isFrameioAuthedFlag()) return Promise.resolve(false);
+      return frameioStatus().then(function (result) {
+        var data = result && result.data ? result.data : {};
+        return !!(result && result.response && result.response.ok && data.ready);
+      }).catch(function () {
+        return false;
+      });
+    }
+
+    return cachedSessionReady().then(function (ready) {
+      if (ready) {
+        setHeaderStatus("Adobe session verified — sending to Frame.io…", false, { persist: true });
+        // Preserve the click-reserved result window for the eventual preview/folder.
+        if (existingWin && !existingWin.closed) window.__firebirdFrameioResultTab = existingWin;
+        return true;
+      }
+
+      return new Promise(function (resolve, reject) {
+      var popup = (existingWin && !existingWin.closed) ? existingWin : null;
+      if (!popup) {
+        try { popup = window.open("about:blank", "firebirdAdobeLogin", "width=640,height=780,menubar=no,toolbar=no,location=yes"); } catch (_) { popup = null; }
+      }
+      window.__firebirdFrameioResultTab = popup;
+
+      var settled = false;
+      var authPoll = null;
+      var authStartedKey = "firebird_frameio_gate_ims_started_" + getFrameioUsageId();
+
+      function cleanup() {
+        window.removeEventListener("message", onMessage);
+        if (authPoll) { clearInterval(authPoll); authPoll = null; }
+      }
+      function succeed() {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        sessionStorage.removeItem(authStartedKey);
+        // Do NOT mark the session trusted yet. OAuth completion is not proof
+        // that the selected Adobe profile can upload to Project_FIREBIRD. The
+        // first real successful Frame.io push establishes the cache in
+        // onFrameioSendSuccess().
+        setFrameioAuthed(false);
+        if (existingWin && !existingWin.closed) window.__firebirdFrameioResultTab = existingWin;
+        resolve(true);
+      }
+      function fail(err) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        sessionStorage.removeItem(authStartedKey);
+        setFrameioAuthed(false);
+        reject(err instanceof Error ? err : new Error(String(err || "Adobe sign-in failed.")));
+      }
+      function onMessage(ev) {
+        if (settled || ev.origin !== window.location.origin) return;
+        var d = ev.data || {};
+        if (!d || d.type !== "firebird-frameio-auth") return;
+        if (!d.ok) { fail(new Error(d.error || "Adobe sign-in failed.")); return; }
+        // Callback completed a fresh IMS login. Do NOT mark the old fast-path flag
+        // as authoritative; the next Frame.io operation will explicitly re-enter
+        // this gate as well.
+        succeed();
+      }
+
+      window.addEventListener("message", onMessage);
+      setHeaderStatus("Adobe sign-in required — choose the Adobe, Inc profile with access to Project_FIREBIRD…", false, { persist: true });
+
+      fetch(GBIRDS_FRAMEIO_BASE + "?api=frameio-auth-begin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        body: JSON.stringify({ usage_id: getFrameioUsageId(), auth_only: true })
+      }).then(function (r) {
+        return r.json().catch(function(){ return {}; }).then(function (data) {
+          if (!r.ok || !data.ok || !data.authorizeUrl) throw new Error(data.error || "Could not start Adobe IMS authentication.");
+          sessionStorage.setItem(authStartedKey, "1");
+          if (popup && !popup.closed) {
+            popup.location.href = data.authorizeUrl;
+            authPoll = setInterval(function () {
+              if (settled) return;
+              if (popup && popup.closed) fail(new Error("Adobe sign-in window was closed before finishing."));
+            }, 800);
+          } else {
+            // Popup blocked. The callback redirects the main tab back into GetBirds.
+            window.location.href = data.authorizeUrl;
+          }
+        });
+      }).catch(fail);
+      });
+    });
+  }
+
   function onSendLocalCaptureToAdobe(postcard, media, button) {
     if (!postcard || !media || !media.blob || busy) return;
 
@@ -6777,9 +8846,8 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       return;
     }
 
-    // Open the result window SYNCHRONOUSLY inside the click gesture (same trick
-    // as onSendToAdobe) so navigating it after the async upload finishes isn't
-    // blocked as a non-user-initiated popup.
+    // Open the result window SYNCHRONOUSLY inside the click gesture so the same
+    // window can become the Adobe login and later the Frame.io asset preview.
     var gestureWin = null;
     try { gestureWin = window.open("about:blank", "firebirdFrameioResult"); } catch (_) { gestureWin = null; }
     window.__firebirdFrameioResultTab = gestureWin;
@@ -6789,34 +8857,25 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       window.__firebirdFrameioResultTab = null;
     }
 
-    function doUpload() {
-      setSendToAdobeButton(button, "uploading", "Uploading…");
-      return sendLocalCaptureToFrameio(postcard, media);
-    }
-
     function run() {
-      doUpload().then(function (data) {
+      setSendToAdobeButton(button, "uploading", "Uploading…");
+      sendLocalCaptureToFrameio(postcard, media).then(function (data) {
         onFrameioSendSuccess(data, button, mediaKey);
       }).catch(function (err) {
         abortGesture();
         setSendToAdobeButton(button, "idle", "Send to Adobe");
+        setFrameioAuthed(false);
         setHeaderStatus((err && err.message) || "Could not send the live frame to Adobe.", true);
       });
     }
 
-    // Local captures skip the popup-based Adobe re-auth dance (the blob can't
-    // survive a full-page redirect) — require an existing master login instead.
-    if (isFrameioAuthedFlag()) { run(); return; }
-    frameioStatus().then(function (res) {
-      var ready = res && res.data && (res.data.ready || res.data.authenticated);
-      if (ready) { setFrameioAuthed(true); run(); }
-      else {
-        abortGesture();
-        setHeaderStatus("Sign in to Adobe first — use Send to Adobe on any regular postcard, then try saving this live frame again.", true);
-      }
-    }).catch(function () {
+    // Local captures now use the exact same first-need Adobe gate as regular
+    // postcard media. The blob remains in JS memory while the auth popup runs.
+    ensureFrameioAdobeGate(postcard, media, gestureWin).then(run).catch(function (err) {
       abortGesture();
-      setHeaderStatus("Sign in to Adobe first — use Send to Adobe on any regular postcard, then try saving this live frame again.", true);
+      setSendToAdobeButton(button, "idle", "Send to Adobe");
+      setFrameioAuthed(false);
+      setHeaderStatus((err && err.message) || "Adobe sign-in is required before sending to Frame.io.", true, { persist: true });
     });
   }
 
@@ -6867,19 +8926,17 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       });
     }
 
-    // ONE MASTER LOGIN: only prompt Adobe login when the server session is not
-    // already authenticated. If we already know it is (fast-path flag), upload
-    // directly; otherwise confirm with the server before deciding.
-    if (isFrameioAuthedFlag()) {
+    // ALWAYS require a fresh Adobe IMS login before this Send to Adobe operation.
+    // This prevents a stale/multi-profile Adobe session from silently selecting the
+    // wrong Adobe profile before we touch Frame.io.
+    ensureFrameioAdobeGate(postcard, media, gestureWin).then(function () {
       directUpload();
-      return;
-    }
-    frameioStatus().then(function (res) {
-      var ready = res && res.data && (res.data.ready || res.data.authenticated);
-      if (ready) { setFrameioAuthed(true); directUpload(); }
-      else { loginThenUpload(); }
-    }).catch(function () {
-      loginThenUpload();
+    }).catch(function (err) {
+      try { if (gestureWin && !gestureWin.closed) gestureWin.close(); } catch (_) {}
+      window.__firebirdFrameioResultTab = null;
+      setSendToAdobeButton(button, "idle", "Send to Adobe");
+      setFrameioAuthed(false);
+      setHeaderStatus((err && err.message) || "Adobe sign-in is required before sending to Frame.io.", true, { persist: true });
     });
   }
 
@@ -8227,7 +10284,15 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
 
   function updateGetBirdsTvOverlays(segment) {
     if (getbirdsTvLowerThird) {
-      getbirdsTvLowerThird.textContent = segment ? segment.species + " · " + segment.createdAt : "";
+      getbirdsTvLowerThird.innerHTML = "";
+      if (segment) {
+        var detail = getSpeciesDetails(segment.postcard || {})[0] || { name: segment.species || UNKNOWN_SPECIES_LABEL };
+        var icon = document.createElement("span"); icon.className = "species-icon-fallback"; icon.style.width = "2rem"; icon.style.height = "2rem"; icon.style.background = "rgba(255,255,255,0.9)"; icon.style.color = "#211b26"; icon.textContent = "🐦";
+        var src = speciesIconSrc(detail.iconUrl);
+        if (src) { var ti = document.createElement("img"); ti.className = "species-icon"; ti.style.width = "2rem"; ti.style.height = "2rem"; ti.src = src; ti.alt = ""; ti.addEventListener("error", function(){ ti.replaceWith(icon); }); icon = ti; }
+        var copy = document.createElement("span"); copy.textContent = segment.species + " · " + segment.createdAt;
+        getbirdsTvLowerThird.appendChild(icon); getbirdsTvLowerThird.appendChild(copy);
+      }
       getbirdsTvLowerThird.style.display = segment ? "block" : "none";
       getbirdsTvLowerThird.setAttribute("aria-hidden", segment ? "false" : "true");
     }
@@ -8348,7 +10413,7 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
      Safari-capable clients, stand up a transcoder on a VPS, or embed BirdBuddy's
      own player. Leaving the flow implemented but flagged for re-implementation.
 
-     Mirrors GetBirds.TV: reuses the same fullscreen overlay + <video>, but plays
+     Mirrors Carousel of Birdos: reuses the same fullscreen overlay + <video>, but plays
      the BirdBuddy live camera feed instead of postcard MP4s. Flow (from the
      BirdBuddy app): watchingStart (watchingStartV2) → poll watchingStartCheck
      until a WatchingActiveResult with a streamUrl, or a WatchingFailedResult
@@ -8647,8 +10712,6 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     if (!group) return;
     var grid = group.querySelector(".postcard-group-media");
     if (grid) grid.appendChild(buildMediaCard(postcard, frameMedia, postcard.medias.length - 1));
-    var badge = group.querySelector(".postcard-group-label .badge");
-    if (badge) badge.textContent = mediaSummary(postcard.medias);
     var mediaCountVal = group.querySelector(".media-count-meta-value");
     if (mediaCountVal) mediaCountVal.textContent = postcard.medias.length + " item" + (postcard.medias.length === 1 ? "" : "s");
   }
@@ -8822,79 +10885,174 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     getbirdsTvSegments = [];
   }
 
-  // Bulk "Send to Adobe" from the carousel — sends every checked asset one at
-  // a time (each awaited before the next fires, same staggering as WHO DEM?!?),
-  // then closes the overlay and opens the Frame.io project root in a new tab
-  // (there's no single "the" asset to preview once several went up at once).
+  // Bulk "Send to Adobe" from the carousel.
+  //
+  // IMPORTANT: the batch button is itself a user gesture, so open exactly ONE
+  // real browser window immediately.  That window is reused for Adobe IMS (when
+  // needed) and then navigated to the actual Frame.io destination folder after
+  // every selected asset has been accepted by the server.  Never silently fall
+  // back to the project root and never require the user to perform a separate
+  // single-asset upload first.
   function runGetBirdsTvSendBatch() {
     if (busy || getbirdsTvBatchSet.size === 0) return;
     var indexes = Array.from(getbirdsTvBatchSet).sort(function (a, b) { return a - b; });
-    var items = indexes.map(function (i) { return getbirdsTvSegments[i]; }).filter(function (seg) { return seg && seg.postcard && seg.media; });
+    var items = indexes.map(function (i) { return getbirdsTvSegments[i]; }).filter(function (seg) {
+      return seg && seg.postcard && seg.media && (seg.media.url || seg.media.blob);
+    });
     if (!items.length) return;
+
+    // Do NOT open the Frame.io result tab yet. Keep the GetBirds carousel visible
+    // with the FireBird rainbow loader for the entire upload sequence, then open
+    // the actual Frame.io destination only after the final upload completes.
+    var resultWin = null;
+
+    function closeResultWindow() {
+      try { if (resultWin && !resultWin.closed) resultWin.close(); } catch (_) {}
+      resultWin = null;
+      window.__firebirdFrameioResultTab = null;
+    }
+
+    function openCompletedDestination(url) {
+      var target = String(url || '').trim();
+      if (!target) return false;
+      var opened = false;
+      try { opened = !!window.open(target, 'firebirdFrameioBatchResult'); } catch (_) { opened = false; }
+      if (opened) {
+        window.__firebirdFrameioResultTab = null;
+        resultWin = null;
+        return true;
+      }
+      return false;
+    }
+
+    // The Adobe gate may use its own login popup when authentication is required;
+    // the Frame.io destination tab itself remains deferred until upload completion.
+    function ensureFrameioAuthenticated() {
+      return ensureFrameioAdobeGate(items[0].postcard, items[0].media, null);
+    }
 
     function proceed() {
       setBusy(true);
       if (getbirdsTvVideo) getbirdsTvVideo.pause();
       if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = true;
       if (getbirdsTvClose) getbirdsTvClose.disabled = true;
+
       var total = items.length;
       var sentCount = 0, skippedCount = 0, failedCount = 0;
-      var lastProjectId = "", lastFolderId = "";
+      var errors = [];
+      var lastProjectId = "", lastFolderId = "", lastFolderName = "", lastFolderViewUrl = "";
+      var destinationFolders = Object.create(null);
+      var reauthedThisBatch = false;
 
-      function next(i) {
-        if (i >= items.length) return Promise.resolve();
-        var seg = items[i];
-        showFirebirdSendingMessage("Asset " + (i + 1) + " of " + total + "…");
+      function noteResult(result) {
+        if (!result) return;
+        if (result.folderId) {
+          lastProjectId = String(result.projectId || lastProjectId || FRAMEIO_PROJECT_ID);
+          lastFolderId = String(result.folderId);
+          lastFolderName = String(result.folderName || result.dateName || lastFolderName);
+          lastFolderViewUrl = String(result.folderViewUrl || lastFolderViewUrl);
+          if (!lastFolderViewUrl && lastProjectId && lastFolderId) {
+            lastFolderViewUrl = "https://next.frame.io/project/" + encodeURIComponent(lastProjectId) + "/" + encodeURIComponent(lastFolderId);
+          }
+          destinationFolders[lastFolderId] = lastFolderName || lastFolderId;
+        }
+      }
+
+      function uploadOne(seg, index) {
+        showFirebirdSendingMessage("Asset " + (index + 1) + " of " + total + "…");
         var mediaKey = frameioMediaKey(seg.media);
         if (mediaKey && isFrameioSent(mediaKey)) {
           skippedCount += 1;
-          return next(i + 1);
+          return Promise.resolve();
         }
+
         return sendMediaToFrameioBare(seg.postcard, seg.media).then(function (result) {
           sentCount += 1;
-          if (result && result.folderId) { lastProjectId = result.projectId || lastProjectId; lastFolderId = result.folderId; }
+          noteResult(result);
           if (mediaKey) {
             recordFrameioSent(mediaKey, result && result.viewUrl);
             markFrameioSentButtons(mediaKey);
           }
-          return next(i + 1);
-        }).catch(function () {
+        }).catch(function (err) {
+          // A 401 here means OUR server says its Adobe session is no longer valid.
+          // Reauthenticate once, then retry the same item. No Frame.io upload was
+          // accepted by our server on the 401 path, so the retry is safe.
+          if (err && err.needsAuth && !reauthedThisBatch) {
+            reauthedThisBatch = true;
+            setFrameioAuthed(false);
+            setHeaderStatus("Adobe session expired. Re-authenticating once, then resuming the batch…", false, { persist: true });
+            return ensureFrameioAuthenticated().then(function () {
+              return sendMediaToFrameioBare(seg.postcard, seg.media);
+            }).then(function (result) {
+              sentCount += 1;
+              noteResult(result);
+              if (mediaKey) {
+                recordFrameioSent(mediaKey, result && result.viewUrl);
+                markFrameioSentButtons(mediaKey);
+              }
+            });
+          }
           failedCount += 1;
-          return next(i + 1);
+          errors.push((err && err.message) || "Frame.io upload failed.");
         });
+      }
+
+      function next(i) {
+        if (i >= items.length) return Promise.resolve();
+        return uploadOne(items[i], i).then(function () { return next(i + 1); });
       }
 
       next(0).then(function () {
         if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = false;
         if (getbirdsTvClose) getbirdsTvClose.disabled = false;
+        setFrameioAuthed(sentCount > 0 || skippedCount > 0);
+
+        // ONLY open an actual destination folder returned by the server, and do it
+        // after the final selected asset has completed. The FireBird rainbow loader
+        // remains visible until this moment instead of exposing an empty Frame.io tab.
+        var destinationCount = Object.keys(destinationFolders).length;
+        var openedDestination = false;
+        if (lastFolderViewUrl) {
+          openedDestination = openCompletedDestination(lastFolderViewUrl);
+        }
+
+        // The upload is complete; now dismiss the loader/view.
         hideLiveMessage();
         closeGetBirdsTV();
         setBusy(false);
-        setFrameioAuthed(true);
-        // Open the actual destination folder the batch landed in, not the bare
-        // project root — falls back to the root only if nothing in the batch
-        // actually reported a folder (e.g. everything was skipped/failed).
-        var folderUrl = "https://next.frame.io/project/" + encodeURIComponent(lastProjectId || FRAMEIO_PROJECT_ID) +
-          (lastFolderId ? "/" + encodeURIComponent(lastFolderId) : "");
-        try { window.open(folderUrl, "_blank"); } catch (_) {}
+        if (!openedDestination && resultWin) closeResultWindow();
+
         var msg = "Sent " + sentCount + " asset" + (sentCount === 1 ? "" : "s") + " to Adobe";
+        if (lastFolderName) msg += " · destination: " + lastFolderName;
+        if (destinationCount > 1) msg += " · " + destinationCount + " create-date folders used";
         if (skippedCount) msg += " (" + skippedCount + " already sent)";
         if (failedCount) msg += " — " + failedCount + " failed";
+        if (sentCount > 0 && !lastFolderViewUrl) msg += " · WARNING: no Frame.io destination folder was returned; nothing was opened";
+        else if (sentCount > 0 && !openedDestination) msg += " · WARNING: Frame.io destination was returned but the browser blocked the result tab";
+        if (errors.length) msg += " — " + errors[0];
         msg += ".";
-        setHeaderStatus(msg, failedCount > 0);
+        setHeaderStatus(msg, failedCount > 0 || !sentCount, { persist: failedCount > 0 || !sentCount });
+      }).catch(function (err) {
+        setBusy(false);
+        if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = false;
+        if (getbirdsTvClose) getbirdsTvClose.disabled = false;
+        hideLiveMessage();
+        closeResultWindow();
+        setFrameioAuthed(false);
+        setHeaderStatus((err && err.message) || "Could not complete the Frame.io batch.", true, { persist: true });
       });
     }
 
-    // Batch mode requires an existing Frame.io session already — juggling the
-    // popup-based re-auth dance across N sequential uploads would be fragile,
-    // same reasoning as local-capture sends.
-    if (isFrameioAuthedFlag()) { proceed(); return; }
-    frameioStatus().then(function (res) {
-      var ready = res && res.data && (res.data.ready || res.data.authenticated);
-      if (ready) { setFrameioAuthed(true); proceed(); }
-      else showLiveMessage("🔒", "Sign in to Adobe first", "Use Send to Adobe on any single postcard from the grid, then try this batch again.");
-    }).catch(function () {
-      showLiveMessage("🔒", "Sign in to Adobe first", "Use Send to Adobe on any single postcard from the grid, then try this batch again.");
+    ensureFrameioAuthenticated().then(function () {
+      proceed();
+    }).catch(function (err) {
+      closeReservedWindow();
+      setBusy(false);
+      if (getbirdsTvSendBatch) getbirdsTvSendBatch.disabled = false;
+      if (getbirdsTvClose) getbirdsTvClose.disabled = false;
+      hideLiveMessage();
+      setFrameioAuthed(false);
+      setHeaderStatus((err && err.message) || "Adobe sign-in is required before the batch can be uploaded.", true, { persist: true });
     });
   }
 
@@ -8928,14 +11086,26 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
         if (!profile.sub) throw new Error(profile.error || "Profile failed");
         localStorage.setItem(STORAGE_KEYS.picture, profile.picture || "");
         localStorage.setItem(STORAGE_KEYS.name, profile.name || "");
-        showLoggedIn({ picture: profile.picture, name: profile.name });
+        activeGoogleProfile = { sub: profile.sub || "", picture: profile.picture || "", name: profile.name || "" };
+        return showLoggedIn(activeGoogleProfile, { promptUnknowns: true }).then(function (entered) {
+          if (!entered && !noCameraGateOpen) showLogin();
+          return entered;
+        });
       })
-      .catch(function () { showLogin(); })
+      .catch(function (e) {
+        if (isNoCameraAuthError(e)) {
+          showNoCameraGate(activeGoogleProfile);
+          return;
+        }
+        showLogin();
+      })
       .finally(function () { setBusy(false); });
   }
 
   /* Google token treated as expired this many ms before expiry (force re-sign-in). */
   var GOOGLE_TOKEN_BUFFER_MS = 60 * 1000;
+
+  loadLoginAssetWall();
 
   async function restoreSession() {
     var token = localStorage.getItem(STORAGE_KEYS.googleAccessToken);
@@ -8947,9 +11117,17 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
       if (!r.ok || !profile.sub) return false;
       localStorage.setItem(STORAGE_KEYS.picture, profile.picture || "");
       localStorage.setItem(STORAGE_KEYS.name, profile.name || "");
-      showLoggedIn({ picture: profile.picture, name: profile.name });
-      return true;
-    } catch (_) { return false; }
+      activeGoogleProfile = { sub: profile.sub || "", picture: profile.picture || "", name: profile.name || "" };
+      var entered = await showLoggedIn(activeGoogleProfile);
+      if (entered) return true;
+      return noCameraGateOpen;
+    } catch (e) {
+      if (isNoCameraAuthError(e)) {
+        showNoCameraGate(activeGoogleProfile);
+        return true;
+      }
+      return false;
+    }
   }
 
   function clearSession() {
@@ -9013,6 +11191,13 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     startLogin();
   });
 
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Escape" || !ufoPromptOpen) return;
+    firstLoginUnknownPromptPending = false;
+    ufoPromptHandled = true;
+    closeUfoDetectPrompt();
+  });
+
   if (avatarWrap) {
     avatarWrap.addEventListener("click", function () {
       if (busy) return;
@@ -9024,15 +11209,75 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
     });
   }
 
+  if (noCameraGateAvatarWrap) {
+    noCameraGateAvatarWrap.addEventListener("click", function () {
+      if (busy) return;
+      setBusy(true);
+      signOut().finally(function () { setBusy(false); });
+    });
+    noCameraGateAvatarWrap.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); noCameraGateAvatarWrap.click(); }
+    });
+  }
+
+
+  if (ufoDetectNo) {
+    ufoDetectNo.addEventListener("click", function () {
+      firstLoginUnknownPromptPending = false;
+      ufoPromptHandled = true;
+      closeUfoDetectPrompt();
+    });
+  }
+  if (ufoDetectYes) {
+    ufoDetectYes.addEventListener("click", function () {
+      if (!ufoPromptOpen || busy) return;
+      firstLoginUnknownPromptPending = false;
+      runFirstLoginUfoIdentification();
+    });
+  }
+  if (ufoDetectModalClose) {
+    ufoDetectModalClose.addEventListener("click", function () {
+      firstLoginUnknownPromptPending = false;
+      ufoPromptHandled = true;
+      closeUfoDetectPrompt();
+    });
+  }
+  if (ufoDetectModalOverlay) {
+    ufoDetectModalOverlay.addEventListener("click", function (ev) {
+      if (ev.target !== ufoDetectModalOverlay) return;
+      firstLoginUnknownPromptPending = false;
+      ufoPromptHandled = true;
+      closeUfoDetectPrompt();
+    });
+  }
 
   if (youtubeModalClose) {
     youtubeModalClose.addEventListener("click", closeYouTubeUploadModal);
   }
+  if (birdBuddyAssetModalClose) {
+    birdBuddyAssetModalClose.addEventListener("click", closeBirdBuddyAssetBrowser);
+  }
+  if (birdBuddyAssetModalOverlay) {
+    birdBuddyAssetModalOverlay.addEventListener("click", function (ev) { if (ev.target === birdBuddyAssetModalOverlay) closeBirdBuddyAssetBrowser(); });
+  }
   if (carouselViewBtn) {
     carouselViewBtn.addEventListener("click", function () { openGetBirdsTV(); });
   }
+  if (postcardSortSelect) {
+    postcardSortSelect.addEventListener("change", function () {
+      if (busy) return;
+      var mode = postcardSortSelect.value || "";
+      if (mode === "assets") { postcardSortSelect.value = postcardSortMode || ""; openBirdBuddyAssetBrowser(); return; }
+      postcardSortMode = mode;
+      birdsOnlyFilter = mode === "birds";
+      applyPostcardSort();
+      var labels = { "":"DEFAULT ORDER", newest:"NEWEST → OLDEST", oldest:"OLDEST → NEWEST", most:"MOST PICS → LEAST", least:"LEAST PICS → MOST", birds:"BIRDS ONLY" };
+      setHeaderStatus("SORT: " + (labels[mode] || "DEFAULT ORDER"), false, { persist: false });
+      updateFooter();
+    });
+  }
   if (onCameraFeedBtn) {
-    onCameraFeedBtn.addEventListener("click", function () { switchFeedMode("inbox"); });
+    onCameraFeedBtn.addEventListener("click", function () { pullAllCameraPostcards(); });
   }
   if (getbirdsLiveBtn) {
     getbirdsLiveBtn.addEventListener("click", function () { openGetBirdsLive(); });
@@ -9043,6 +11288,9 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   if (getbirdsTvClose) {
     getbirdsTvClose.addEventListener("click", closeGetBirdsTV);
   }
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && birdBuddyAssetModalOpen) { e.preventDefault(); closeBirdBuddyAssetBrowser(); }
+  });
   if (getbirdsTvSelectCheckbox && getbirdsTvSelectWrap) {
     getbirdsTvSelectWrap.addEventListener("click", function (ev) { ev.stopPropagation(); });
     getbirdsTvSelectCheckbox.addEventListener("change", function () {
@@ -9139,3 +11387,194 @@ if ($api === 'firebird-art-seed') gbirds_firebird_placeholder();
   </script>
 </body>
 </html>
+<?php } else { ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GetBirds</title>
+<link rel="preconnect" href="https://accounts.google.com">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{background:#f5f1f8}
+#boot{position:fixed;inset:0;overflow:hidden;background:#f5f1f8}
+#loginView{position:absolute;inset:0;overflow:hidden;background:#17131a}
+#loginWall{position:absolute;inset:0;display:grid;grid-template-columns:repeat(var(--cols,8),minmax(0,1fr));grid-template-rows:repeat(var(--rows,5),minmax(0,1fr));background:#17131a}
+.loginTile{min-width:0;min-height:0;overflow:hidden;background:#241d28}
+.loginTile img{width:100%;height:100%;display:block;object-fit:cover}
+#loginShade{position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at center,rgba(0,0,0,.05),rgba(0,0,0,.20))}
+#loginGoogle{position:absolute;z-index:4;left:50%;top:50%;transform:translate(-50%,-50%);display:inline-flex;align-items:center;justify-content:center;gap:.7rem;padding:.9rem 1.35rem;border:0;border-radius:14px;background:#6f3c8f;color:#fff;font:600 1rem system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 12px 36px rgba(0,0,0,.35),0 0 0 4px rgba(255,255,255,.14);cursor:pointer;white-space:nowrap}
+#loginGoogle:disabled{opacity:.7;cursor:default}
+#noCameraView{position:absolute;inset:0;display:none;overflow:hidden;background:radial-gradient(circle at 50% 50%,rgba(111,60,143,.10),transparent 48%),linear-gradient(135deg,#f8f4fa 0%,#eee7f2 50%,#dfd4e7 100%)}
+#noCameraStage{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr;align-items:center;justify-items:center;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+#noCameraBird{grid-column:1;grid-row:1;width:100%;height:100%;max-width:100%;max-height:100%;object-fit:contain;display:block;filter:drop-shadow(0 32px 60px rgba(33,27,38,.22));animation:visitorFloat 5s ease-in-out infinite;pointer-events:none;user-select:none}
+#noCameraAvatarBtn{grid-column:2;grid-row:1;position:relative;z-index:3;width:min(45vw,80vh);height:min(45vw,80vh);max-width:80vh;max-height:80vh;border:0;padding:0;border-radius:50%;background:#fff;box-shadow:0 28px 80px rgba(33,27,38,.24),0 0 0 1px rgba(255,255,255,.75);cursor:pointer;overflow:hidden}
+#noCameraAvatar{width:100%;height:100%;display:block;object-fit:cover;border-radius:50%;border:clamp(4px,.45vw,8px) solid rgba(255,255,255,.92);background:#ece5f1}
+#noCameraAvatarX{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(200,50,43,.80);color:#fff;font-size:clamp(3rem,6vw,6rem);font-weight:700;opacity:0;transition:opacity .15s ease;pointer-events:none}
+#noCameraAvatarBtn:hover #noCameraAvatarX,#noCameraAvatarBtn:focus-visible #noCameraAvatarX{opacity:1}
+#noCameraAvatarBtn:focus-visible{outline:4px solid rgba(111,60,143,.35);outline-offset:8px}
+@keyframes visitorFloat{0%,100%{transform:translateY(0) rotate(-.35deg)}50%{transform:translateY(-10px) rotate(.35deg)}}
+@media(prefers-reduced-motion:reduce){#noCameraBird{animation:none}}
+</style>
+</head>
+<body>
+<!-- Contact HH5HH's top Bird Brains for more details on what's presently in the lab@hh5hh.com -->
+<div id="boot">
+<section id="loginView" aria-label="">
+<div id="loginWall" aria-hidden="true"></div><div id="loginShade" aria-hidden="true"></div>
+<button id="loginGoogle" type="button"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>Sign in with Google</button>
+</section>
+<section id="noCameraView" aria-label=""><div id="noCameraStage">
+<button id="noCameraAvatarBtn" type="button" aria-label="Sign out"><img id="noCameraAvatar" alt=""><span id="noCameraAvatarX" aria-hidden="true">&times;</span></button>
+<img id="noCameraBird" alt="" aria-hidden="true" src="data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMzAwIDMwMCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xNjcuNSAyMS44NjcxQzE1My42MzEgMjUuODUyMSAxNDEuMzI2IDM1Ljc1NTEgMTM2LjAyMyA0Ny4xOTgxQzEzNC4zMTkgNTAuODc2MSAxMzEuODE2IDU5Ljc0MDEgMTMwLjAxMiA2OC40ODcxQzEyOC4zMTEgNzYuNzMwMSAxMjYuMjEzIDg0LjU1MzEgMTI1LjM0OCA4NS44NzIxQzEyNC40ODQgODcuMTkxMSAxMTkuNjI1IDkyLjQzNTEgMTE0LjU1IDk3LjUyNzFDOTguNTQ2MSAxMTMuNTgzIDkxLjI2ODEgMTI2LjkyMSA3Mi4yNzUxIDE3NUM1OC4zNDgxIDIxMC4yNTMgNTcuNDMzMSAyMTIuNzY2IDU4LjIyNTEgMjEzLjU1OEM1OC45NTIxIDIxNC4yODYgNzEuODY4MSAyMDguNDI5IDc0LjIxMDEgMjA2LjMxQzc3LjgxNjEgMjAzLjA0NiA3Ny4wODQxIDIwNi4wMiA3Mi41NTkxIDIxMy4wMTRDNjYuODM4MSAyMjEuODU4IDU2LjQyNzEgMjM1LjgxNSA0NS45NTQxIDI0OC42ODFDMzYuODkwMSAyNTkuODE1IDM0LjY3NjEgMjY0LjU1OSAzNy41NTkxIDI2Ni42NjdDNDAuMTUxMSAyNjguNTYyIDQ3Ljc5MTEgMjY4LjI3OCA1Mi41NjgxIDI2Ni4xMDhDNTYuMDA0MSAyNjQuNTQ4IDU2LjkxODEgMjY0LjQ2NyA1OC40NDcxIDI2NS41ODVDNTkuOTgwMSAyNjYuNzA2IDYwLjgxNDEgMjY2LjYyMSA2My44NzkxIDI2NS4wMzFDNjguNDcxMSAyNjIuNjQ5IDc4Ljk1NzEgMjUxLjg0NCA4Ni43MTcxIDI0MS41Qzk1LjAwOTEgMjMwLjQ0NSAxMDMuOTI1IDIxOS42NDggMTA1LjUwMSAyMTguNzUxQzEwNy4xMTkgMjE3LjgzMSAxMTguODY1IDIyMi45ODkgMTIxLjEyNiAyMjUuNjEzQzEyMi4wMjEgMjI2LjY1MSAxMjUuMzY1IDIzNC42MzMgMTI4LjU1NyAyNDMuMzUxQzEzNS42NDUgMjYyLjcwNCAxMzUuNjYyIDI2Mi42MjYgMTI0LjI4IDI2Mi4yMDdDMTE3LjgwMSAyNjEuOTY5IDExNS45MzQgMjYyLjI0NyAxMTQuMjA2IDI2My43MDdDMTA5LjEzMiAyNjcuOTk2IDExMS45MDIgMjY4Ljg3IDEzMi4wNzMgMjY5LjM0NUMxMzcuNjM4IDI2OS40NzYgMTM5LjIyNiAyNjkuOTQxIDE0Mi40MjUgMjcyLjM3OEMxNDQuNTAzIDI3My45NjIgMTQ4LjEzNyAyNzUuODM5IDE1MC40OTkgMjc2LjU1QzE1Mi44NjIgMjc3LjI2MSAxNTYuMjA0IDI3OC41NzEgMTU3LjkyNyAyNzkuNDYyQzE2MS4zODMgMjgxLjI1IDE2MyAyODAuODE0IDE2MyAyNzguMDk2QzE2MyAyNzUuODU2IDE2MC4wODYgMjczLjE2NSAxNTYuMzU3IDI3MS45NjNDMTU0LjMwNyAyNzEuMzAyIDE1NS4zMzYgMjcxLjIwOSAxNjAgMjcxLjYzMkMxNjMuNTc1IDI3MS45NTYgMTY4LjAxNyAyNzIuODQ2IDE2OS44NzIgMjczLjYxQzE3NC41NDEgMjc1LjUzNCAxNzUgMjc1LjQwMSAxNzUgMjcyLjEyMkMxNzUgMjY3LjU0NCAxNzIuODQ0IDI2Ni42MDcgMTYwLjkxIDI2NS45OTVDMTQ4LjIxNyAyNjUuMzQ1IDE0Ni4wODUgMjY0LjI1NyAxNDEuNjk4IDI1Ni4xOTNDMTM4Ljk1NSAyNTEuMTUxIDEzNCAyMzMuOTYgMTM0IDIyOS40ODVDMTM0IDIyNi44OTUgMTM1Ljg4NyAyMjYuNDcyIDE1MiAyMjUuNDU3TDE2MS41IDIyNC44NTlMMTcwLjMxMyAyMzguMzExQzE3NS4xNiAyNDUuNzA5IDE3OS4zNzIgMjUyLjcwOCAxNzkuNjc1IDI1My44NjRDMTgwLjQ2MSAyNTYuODcgMTc1Ljg0OSAyNTguNTU2IDE3MC44ODQgMjU3LjA3N0MxNjUuODAxIDI1NS41NjMgMTYwLjQ2MiAyNTUuNzM4IDE1OS4wMjggMjU3LjQ2NkMxNTYuOTUxIDI1OS45NjkgMTU4LjM4MiAyNjEuMjMzIDE2My41NCAyNjEuNDUyQzE3My43ODYgMjYxLjg4NiAyMDQuMzAyIDI2OC4xMDkgMjEzLjUwNSAyNzEuNjRDMjE1LjY3MiAyNzIuNDcyIDIxNS4zNzkgMjY5LjY1MyAyMTMuMDgxIDI2Ny41NzNDMjEyLjAyNiAyNjYuNjE4IDIwOS4yMTMgMjY1LjE5IDIwNi44MzEgMjY0LjM5OUwyMDIuNSAyNjIuOTYyTDIwOS44NDkgMjYzLjQzMUMyMTQuMjY4IDI2My43MTMgMjE4LjE5OSAyNjQuNTU2IDIxOS43MDYgMjY1LjU0M0MyMjIuNDY2IDI2Ny4zNTIgMjI0LjcwMyAyNjYuMjc0IDIyMy42ODcgMjYzLjYyNUMyMjIuNTYgMjYwLjY4OSAyMTcuODg3IDI1OC43NDUgMjA5LjczOSAyNTcuODIyQzE5My45MzYgMjU2LjAzMSAxOTEuMzU1IDI1NS4yMzQgMTg3Ljc3IDI1MS4wMzRDMTg0LjIzNyAyNDYuODk0IDE3MyAyMjYuMjAyIDE3MyAyMjMuODM1QzE3MyAyMjMuMDQgMTc2LjQ1NCAyMjAuNDU4IDE4MC42NzUgMjE4LjA5N0MyMDEuODYgMjA2LjI0OSAyMTcuMTU1IDE4OC45OTQgMjI1LjE2NyAxNjkuOTI1QzIzMC4xNjggMTU4LjAyMSAyMzMuMjMzIDE0My44MDYgMjMzLjM0MyAxMzJDMjMzLjQ3MSAxMTguNDE4IDIzMS4zNTMgMTEwLjAyNyAyMjQuMzg4IDk2LjUwNTFDMjIxLjMwOSA5MC41MjkxIDIyMCA4NC43MjkxIDIyMCA4Mi45NzMxQzIyMCA3OC45OTMxIDIyMi4xNjkgNzQuODc3MSAyMjUuOTM5IDcxLjcwNTFDMjI5LjI3OSA2OC44OTQxIDI0MC4xNjEgNjYuMDAwMSAyNDcuMzg4IDY2LjAwMDFDMjUzLjExOSA2Ni4wMDAxIDI1My45NDIgNjQuNTkzMSAyNTAuMzgzIDYwLjg3ODFDMjQ3LjA1OCA1Ny40MDcxIDI0Mi40NDQgNTQuNzI3MSAyMzEuNjI4IDQ5Ljk4NDFDMjI0LjYyOCA0Ni45MTQxIDIyMy4zMzEgNDUuOTA2MSAyMTkuOTE2IDQwLjg3NjFDMjA4LjM2NSAyMy44NjcxIDE4Ny4yMjIgMTYuMTk5MSAxNjcuNSAyMS44NjcxWk0xNzcuNTMgOTIuNDQ4MUMxNzkuMjQzIDkzLjE2NDEgMTgyLjMyNyA5NS4yMjYxIDE4NC4zODIgOTcuMDMwMUMxOTYuMjA1IDEwNy40MTEgMTk0LjIwNyAxMjMuMjUyIDE3OS4wMzcgMTM5LjQwM0MxNjkuNzM5IDE0OS4zMDMgMTY4LjAzOSAxNTIuMDcgMTY2Ljg5OCAxNTkuMTU0QzE2NS42NjMgMTY2LjgxOCAxNjUuNTUgMTY3IDE2MS45NzYgMTY3QzE1Ny44MiAxNjcgMTU2LjYxNCAxNjQuMTM5IDE1Ny4zMDQgMTU1LjkxMUMxNTguMDA2IDE0Ny41MzUgMTYwLjE3NyAxNDMuMjEzIDE2OC4wNDMgMTM0LjUzM0MxNzUuNTIgMTI2LjI4MyAxNzcuOTQ5IDEyMS4yOTIgMTc3Ljk3OCAxMTQuMTE4QzE3OC4wMjUgMTAyLjU2OCAxNjguMjI2IDk1LjkxNDEgMTU3LjcxOCAxMDAuMzYyQzE1MS40NDMgMTAzLjAxOCAxNDkuNzk5IDEwNi41MjYgMTUxLjMwNSAxMTQuMDQ5QzE1Mi4xNDcgMTE4LjI1NiAxNTAuNzM2IDEyMC41OTMgMTQ2Ljc3NSAxMjEuNTQ3QzE0NC41ODQgMTIyLjA3NiAxNDMuNDU4IDEyMS42MTIgMTQxLjAyNSAxMTkuMTc5QzEzMy44OSAxMTIuMDQ0IDEzOS42OTkgOTcuNTI1MSAxNTEuNTA0IDkyLjk4NTFDMTU5LjU0NiA4OS44OTMxIDE3MC44NTYgODkuNjYwMSAxNzcuNTMgOTIuNDQ4MVpNMTY3LjA3NyAxNzkuOTIzQzE3MC40OTMgMTgzLjM0IDE3MC43NSAxODYuMjU3IDE2OC4wMjcgMTkwLjcyM0MxNjMuMzE0IDE5OC40NTMgMTUzIDE5NC44NSAxNTMgMTg1LjQ3M0MxNTMgMTgxLjk5MiAxNTguMDA4IDE3NyAxNjEuNSAxNzdDMTYzLjEgMTc3IDE2NS4zMTUgMTc4LjE2MSAxNjcuMDc3IDE3OS45MjNaIiBmaWxsPSIjMDAzMzMzIi8+Cjwvc3ZnPgo=">
+</div></section>
+</div>
+<script>
+(function(){
+"use strict";
+var CLIENT_ID="1022751350446-o1m86gkguv2br1hfr1s2efau3aoj0jf2.apps.googleusercontent.com";
+var SCOPE="openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+var USERINFO_URL="https://openidconnect.googleapis.com/v1/userinfo";
+var REVOKE_URL="https://oauth2.googleapis.com/revoke";
+var BB_GRAPHQL="./gbirds.php?api=birdbuddy";
+var BB_APP_SHELL="./gbirds.php?api=app-shell";
+var BB_ASSETS="./gbirds.php?api=birdbuddy-assets-xml&max_keys=1000";
+var U={g:"google_access_token",ge:"google_expires_at",p:"google_picture",n:"google_name",b:"bb_access_token",be:"bb_expires_at",br:"bb_refresh_token"};
+var loginView=document.getElementById("loginView"),loginWall=document.getElementById("loginWall"),loginGoogle=document.getElementById("loginGoogle"),noCameraView=document.getElementById("noCameraView"),noCameraAvatar=document.getElementById("noCameraAvatar"),noCameraAvatarBtn=document.getElementById("noCameraAvatarBtn"),pool=[],tokenClient=null,busy=false,currentProfile=null,authFlowGeneration=0;
+function clamp(v,a,b){return Math.min(b,Math.max(a,v))}
+function shape(){var w=Math.max(1,window.innerWidth||document.documentElement.clientWidth||1),h=Math.max(1,window.innerHeight||document.documentElement.clientHeight||1),side=clamp(Math.sqrt(w*h)/10.5,64,170),c=Math.ceil(w/side)+1,r=Math.ceil(h/side)+1;return{cols:c,rows:r,count:c*r}}
+function shuffle(a){var x=a.slice();for(var i=x.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1)),t=x[i];x[i]=x[j];x[j]=t}return x}
+function parseAssets(t){var d=new DOMParser().parseFromString(t,"application/xml"),n=d.getElementsByTagNameNS("*","Key"),o=[];for(var i=0;i<n.length;i++){var k=String(n[i].textContent||"").trim();if(/\.(png|jpe?g|gif|webp|svg|avif)$/i.test(k))o.push(k)}return o}
+function renderWall(){var s=shape();loginWall.style.setProperty("--cols",s.cols);loginWall.style.setProperty("--rows",s.rows);loginWall.innerHTML="";shuffle(pool).slice(0,s.count).forEach(function(k){var tile=document.createElement("div"),img=document.createElement("img");tile.className="loginTile";img.alt="";img.loading="eager";img.src="https://assets.cms-api-graphql.cms-api.prod.aws.mybirdbuddy.com/"+k.split("/").map(encodeURIComponent).join("/");tile.appendChild(img);loginWall.appendChild(tile)})}
+function loadWall(){fetch(BB_ASSETS,{credentials:"same-origin",cache:"no-store"}).then(function(r){if(!r.ok)throw 0;return r.text()}).then(function(t){pool=parseAssets(t);renderWall()}).catch(function(){renderWall()})}
+function setAvatar(img,url,name){var p=String(name||"").trim().split(/\s+/).filter(Boolean),initials=p.length>1?(p[0][0]+p[p.length-1][0]).toUpperCase():((p[0]||"?")[0]||"?").toUpperCase(),fallback="data:image/svg+xml,"+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><circle cx="32" cy="32" r="32" fill="#d3c7da"/><text x="32" y="41" text-anchor="middle" font-family="system-ui" font-size="24" fill="#76697c">'+initials+'</text></svg>');img.onerror=function(){img.onerror=null;img.src=fallback};img.src=String(url||"").trim()||fallback}
+function nextAuthFlow(){authFlowGeneration+=1;return authFlowGeneration}
+function isCurrentAuthFlow(flowId){return flowId===authFlowGeneration}
+function showNoCamera(p){currentProfile=p||currentProfile||{};loginView.style.display="none";noCameraView.style.display="block";setAvatar(noCameraAvatar,currentProfile.picture,currentProfile.name);noCameraAvatar.alt="";busy=false;loginGoogle.disabled=false;localStorage.removeItem(U.b);localStorage.removeItem(U.be);localStorage.removeItem(U.br)}
+function showLogin(flowId){if(flowId!=null&&!isCurrentAuthFlow(flowId))return;noCameraView.style.display="none";loginView.style.display="block";loginGoogle.disabled=false;busy=false;renderWall()}
+function waitForGoogle(){return new Promise(function(resolve,reject){var t=0;(function p(){if(window.google&&google.accounts&&google.accounts.oauth2)return resolve();if(++t>80)return reject(0);setTimeout(p,100)})()})}
+function getGoogleClient(){if(tokenClient)return tokenClient;tokenClient=google.accounts.oauth2.initTokenClient({client_id:CLIENT_ID,scope:SCOPE,callback:function(res){var flowId=authFlowGeneration;if(res.error){if(isCurrentAuthFlow(flowId))showLogin(flowId);return}finishGoogle(res.access_token,res.expires_in||3600,flowId)}});return tokenClient}
+function finishGoogle(at,expires,flowId){
+  if(!isCurrentAuthFlow(flowId))return;
+  var exp=Date.now()+Number(expires||3600)*1000;
+  localStorage.setItem(U.g,at);
+  localStorage.setItem(U.ge,String(exp));
+  fetch(USERINFO_URL,{headers:{Authorization:"Bearer "+at,Accept:"application/json"}})
+    .then(function(r){
+      return r.text().then(function(text){
+        var p={};
+        try{p=JSON.parse(text||"{}")}catch(_){ }
+        if(!r.ok||!p.sub){
+          var ue=new Error(String(p.error_description||p.error||"Google profile lookup failed"));
+          ue.googleProfileFailure=true;
+          throw ue;
+        }
+        return p;
+      });
+    })
+    .then(function(p){
+      if(!isCurrentAuthFlow(flowId))throw new Error("stale-auth-flow");
+      currentProfile=p;
+      localStorage.setItem(U.p,p.picture||"");
+      localStorage.setItem(U.n,p.name||"");
+      return authorizeBirdBuddy(at);
+    })
+    .then(function(bt){
+      if(!isCurrentAuthFlow(flowId)) return;
+      return showLoggedIn(activeGoogleProfile,{promptUnknowns:true});
+    })
+    .catch(function(e){
+      if(!isCurrentAuthFlow(flowId))return;
+      if(e && e.noCamera && currentProfile && currentProfile.sub){
+        showNoCamera(currentProfile);
+        return;
+      }
+      showLogin(flowId);
+    })
+}
+function authorizeBirdBuddy(gt){
+  return fetch(BB_GRAPHQL,{
+    method:"POST",
+    headers:{"Content-Type":"application/json","Accept":"application/json"},
+    body:JSON.stringify({
+      operationName:"authSocialSignIn",
+      variables:{socialSignInInput:{token:gt,provider:"GOOGLE"}},
+      query:"mutation authSocialSignIn($socialSignInInput: SocialSignInInput!) { authSocialSignIn(socialSignInInput: $socialSignInInput) { ... on Auth { accessToken refreshToken me { feeders { __typename id } } } } }"
+    })
+  })
+  .then(function(r){
+    return r.text().then(function(text){
+      var d={};
+      try{d=JSON.parse(text||"{}")}catch(_){
+        var pe=new Error("BirdBuddy authorization response was not JSON");
+        pe.noCamera=true;
+        throw pe;
+      }
+      return {response:r,data:d};
+    });
+  })
+  .then(function(x){
+    var r=x.response,d=x.data,a=d&&d.data&&d.data.authSocialSignIn;
+    if(!a||!a.accessToken){
+      var er=d&&d.errors&&d.errors[0],code=String(er&&er.extensions&&er.extensions.code||""),msg=String(er&&er.message||d&&d.message||"");
+      var e=new Error(msg||code||"BirdBuddy authorization failed");
+      e.noCamera = /AUTH_SOCIAL_INVALID_USER_ID|invalid user id|not associated with.*birdbuddy|no birdbuddy/i.test(code+" "+msg);
+      throw e;
+    }
+    localStorage.setItem(U.b,a.accessToken);
+    localStorage.setItem(U.be,String(Date.now()+10*60*1000));
+    if(a.refreshToken)localStorage.setItem(U.br,a.refreshToken);
+    /* Do not reject here merely because the Auth payload omitted me.feeders.
+       The protected app-shell performs the authoritative feeder check. */
+    return a.accessToken;
+  });
+}
+function requestAppShell(bt,flowId){if(!isCurrentAuthFlow(flowId))return Promise.reject(new Error("stale-auth-flow"));return fetch(BB_APP_SHELL,{credentials:"same-origin",headers:{Authorization:"Bearer "+bt,Accept:"text/html"},cache:"no-store"}).then(function(r){return r.text().then(function(text){if(r.status===403){var e=new Error("No BirdBuddy camera associated with this Google account");e.noCamera=true;throw e}if(r.status===401){var ae=new Error("BirdBuddy authorization could not be verified");ae.authVerificationFailed=true;throw ae}if(!r.ok){var ne=new Error("BirdBuddy app gateway unavailable");ne.appShellStatus=r.status;ne.appShellBody=text.slice(0,400);throw ne}if(!/<!doctype html|<html[\s>]/i.test(text)){var xe=new Error("Invalid GetBirds application shell");xe.appShellBody=text.slice(0,400);throw xe}return text})}).then(function(html){if(!isCurrentAuthFlow(flowId))return;if(window.history&&window.history.replaceState){try{history.replaceState(null,"",location.pathname)}catch(_){}}document.open();document.write(html);document.close()})}
+function restore(){
+  var flowId=nextAuthFlow(),g=localStorage.getItem(U.g),exp=parseInt(localStorage.getItem(U.ge)||"0",10);
+  if(!g||!exp||Date.now()>=exp-60000)return false;
+  busy=true;
+  loginGoogle.disabled=true;
+  fetch(USERINFO_URL,{headers:{Authorization:"Bearer "+g,Accept:"application/json"}})
+    .then(function(r){
+      return r.text().then(function(text){
+        var p={};
+        try{p=JSON.parse(text||"{}")}catch(_){ }
+        if(!r.ok||!p.sub)throw new Error("Google session invalid");
+        return p;
+      });
+    })
+    .then(function(p){
+      if(!isCurrentAuthFlow(flowId))throw new Error("stale-auth-flow");
+      currentProfile=p;
+      localStorage.setItem(U.p,p.picture||"");
+      localStorage.setItem(U.n,p.name||"");
+      return authorizeBirdBuddy(g);
+    })
+    .then(function(bt){
+      if(!isCurrentAuthFlow(flowId)) return;
+      return showLoggedIn(currentProfile);
+    })
+    .catch(function(e){
+      if(!isCurrentAuthFlow(flowId))return;
+      if(e && e.noCamera && currentProfile){
+        showNoCamera(currentProfile);
+      }else{
+        showLogin(flowId);
+      }
+    });
+  return true;
+}
+function signOut(){nextAuthFlow();var g=localStorage.getItem(U.g);Object.keys(U).forEach(function(k){localStorage.removeItem(U[k])});if(g)fetch(REVOKE_URL,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"token="+encodeURIComponent(g)}).catch(function(){});window.location.replace(window.location.pathname)}
+loginGoogle.addEventListener("click",function(){if(busy)return;var flowId=nextAuthFlow();busy=true;loginGoogle.disabled=true;waitForGoogle().then(function(){if(!isCurrentAuthFlow(flowId))return;getGoogleClient().requestAccessToken({prompt:"select_account"})}).catch(function(){if(isCurrentAuthFlow(flowId))showLogin(flowId)})});
+noCameraAvatarBtn.addEventListener("click",signOut);
+window.addEventListener("resize",function(){if(noCameraView.style.display!=="block")renderWall()},{passive:true});
+loadWall();if(!restore())showLogin();
+})();
+</script>
+</body>
+</html>
+<?php } ?>
